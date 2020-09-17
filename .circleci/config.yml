@@ -29,6 +29,16 @@ executors:
       - image: klaytn/build_base:1.1-go1.14.6-solc0.4.24
       - image: localstack/localstack:0.10.9
       - image: circleci/mysql:5.7
+      - name: zookeeper
+        image: wurstmeister/zookeeper
+      - name: kafka
+        image: wurstmeister/kafka
+        environment:
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          KAFKA_ADVERTISED_LISTENERS: INSIDE://:9092,OUTSIDE://kafka:9094
+          KAFKA_LISTENERS: INSIDE://:9092,OUTSIDE://kafka:9094
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: INSIDE
   rpm-executor:
     working_directory: /go/src/github.com/klaytn/klaytn
     docker:
