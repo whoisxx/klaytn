@@ -39,9 +39,6 @@ executors:
           KAFKA_LISTENERS: INSIDE://:9092,OUTSIDE://kafka:9094
           KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
           KAFKA_INTER_BROKER_LISTENER_NAME: INSIDE
-          KAFKA_ADVERTISED_HOST_NAME: localhost
-          KAFKA_ADVERTISED_PORT: 9092
-          KAFKA_PORT: 9092
   rpm-executor:
     working_directory: /go/src/github.com/klaytn/klaytn
     docker:
@@ -303,7 +300,7 @@ jobs:
           command: |
             for i in `seq 1 10`;
             do
-              nc -z localhost 9092 && echo Success && exit 0
+              nc -z kafka 9092 && echo Success && exit 0
               echo -n .
               sleep 1
             done
