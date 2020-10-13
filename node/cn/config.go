@@ -82,9 +82,14 @@ type Config struct {
 	Genesis *blockchain.Genesis `toml:",omitempty"`
 
 	// Protocol options
-	NetworkId uint64 // Network ID to use for selecting peers to connect to
-	SyncMode  downloader.SyncMode
-	NoPruning bool
+	NetworkId     uint64 // Network ID to use for selecting peers to connect to
+	SyncMode      downloader.SyncMode
+	NoPruning     bool
+	WorkerDisable bool // disables worker and does not start istanbul
+
+	// KES options
+	DownloaderDisable bool
+	FetcherDisable    bool
 
 	// Service chain options
 	ParentOperatorAddr *common.Address `toml:",omitempty"` // A hex account address in the parent chain used to sign a child chain transaction.

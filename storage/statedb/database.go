@@ -21,8 +21,10 @@
 package statedb
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 	"time"
 
@@ -58,19 +60,6 @@ var (
 	memcacheCleanMissMeter  = metrics.NewRegisteredMeter("trie/memcache/clean/miss", nil)
 	memcacheCleanReadMeter  = metrics.NewRegisteredMeter("trie/memcache/clean/read", nil)
 	memcacheCleanWriteMeter = metrics.NewRegisteredMeter("trie/memcache/clean/write", nil)
-
-	// metrics for fastcache
-	memcacheFastMisses                 = metrics.NewRegisteredGauge("trie/memcache/fast/misses", nil)
-	memcacheFastCollisions             = metrics.NewRegisteredGauge("trie/memcache/fast/collisions", nil)
-	memcacheFastCorruptions            = metrics.NewRegisteredGauge("trie/memcache/fast/corruptions", nil)
-	memcacheFastEntriesCount           = metrics.NewRegisteredGauge("trie/memcache/fast/entries", nil)
-	memcacheFastBytesSize              = metrics.NewRegisteredGauge("trie/memcache/fast/size", nil)
-	memcacheFastGetBigCalls            = metrics.NewRegisteredGauge("trie/memcache/fast/get", nil)
-	memcacheFastSetBigCalls            = metrics.NewRegisteredGauge("trie/memcache/fast/set", nil)
-	memcacheFastTooBigKeyErrors        = metrics.NewRegisteredGauge("trie/memcache/fast/error/too/bigkey", nil)
-	memcacheFastInvalidMetavalueErrors = metrics.NewRegisteredGauge("trie/memcache/fast/error/invalid/matal", nil)
-	memcacheFastInvalidValueLenErrors  = metrics.NewRegisteredGauge("trie/memcache/fast/error/invalid/valuelen", nil)
-	memcacheFastInvalidValueHashErrors = metrics.NewRegisteredGauge("trie/memcache/fast/error/invalid/hash", nil)
 
 	// metric of total node number
 	memcacheNodesGauge = metrics.NewRegisteredGauge("trie/memcache/nodes", nil)
@@ -124,8 +113,9 @@ type Database struct {
 
 	lock sync.RWMutex
 
-	trieNodeCache           TrieNodeCache // GC friendly memory cache of trie node RLPs
-	trieNodeLocalCacheLimit int           // byte size of local trieNodeCache
+	trieNodeCache                TrieNodeCache       // GC friendly memory cache of trie node RLPs
+	trieNodeCacheConfig          TrieNodeCacheConfig // Configuration of trieNodeCache
+	savingTrieNodeCacheTriggered bool                // Whether saving trie node cache has been triggered or not
 }
 
 // rawNode is a simple binary blob used to differentiate between collapsed trie
@@ -324,11 +314,11 @@ func NewDatabaseWithNewCache(diskDB database.DBManager, cacheConfig TrieNodeCach
 	}
 
 	return &Database{
-		diskDB:                  diskDB,
-		nodes:                   map[common.Hash]*cachedNode{{}: {}},
-		preimages:               make(map[common.Hash][]byte),
-		trieNodeCache:           trieNodeCache,
-		trieNodeLocalCacheLimit: cacheConfig.FastCacheSizeMB,
+		diskDB:              diskDB,
+		nodes:               map[common.Hash]*cachedNode{{}: {}},
+		preimages:           make(map[common.Hash][]byte),
+		trieNodeCache:       trieNodeCache,
+		trieNodeCacheConfig: cacheConfig,
 	}
 }
 
@@ -371,9 +361,14 @@ func (db *Database) TrieNodeCache() TrieNodeCache {
 	return db.trieNodeCache
 }
 
-// GetTrieNodeLocalCacheLimit returns the byte size of trie node cache.
-func (db *Database) GetTrieNodeLocalCacheLimit() int {
-	return db.trieNodeLocalCacheLimit
+// GetTrieNodeCacheConfig returns the configuration of TrieNodeCache.
+func (db *Database) GetTrieNodeCacheConfig() TrieNodeCacheConfig {
+	return db.trieNodeCacheConfig
+}
+
+// GetTrieNodeLocalCacheByteLimit returns the byte size of trie node cache.
+func (db *Database) GetTrieNodeLocalCacheByteLimit() uint64 {
+	return uint64(db.trieNodeCacheConfig.LocalCacheSizeMB) * 1024 * 1024
 }
 
 // RLockGCCachedNode locks the GC lock of CachedNode.
@@ -1113,22 +1108,33 @@ func (db *Database) getLastNodeHashInFlushList() common.Hash {
 func (db *Database) UpdateMetricNodes() {
 	memcacheNodesGauge.Update(int64(len(db.nodes)))
 	if db.trieNodeCache != nil {
-		switch c := db.trieNodeCache.(type) {
-		case *FastCache:
-			stats := c.UpdateStats()
-
-			memcacheFastMisses.Update(int64(stats.Misses))
-			memcacheFastCollisions.Update(int64(stats.Collisions))
-			memcacheFastCorruptions.Update(int64(stats.Corruptions))
-			memcacheFastEntriesCount.Update(int64(stats.EntriesCount))
-			memcacheFastBytesSize.Update(int64(stats.BytesSize))
-			memcacheFastGetBigCalls.Update(int64(stats.GetBigCalls))
-			memcacheFastSetBigCalls.Update(int64(stats.SetBigCalls))
-			memcacheFastTooBigKeyErrors.Update(int64(stats.TooBigKeyErrors))
-			memcacheFastInvalidMetavalueErrors.Update(int64(stats.InvalidMetavalueErrors))
-			memcacheFastInvalidValueLenErrors.Update(int64(stats.InvalidValueLenErrors))
-			memcacheFastInvalidValueHashErrors.Update(int64(stats.InvalidValueHashErrors))
-		default:
-		}
+		db.trieNodeCache.UpdateStats()
 	}
+}
+
+var errDisabledTrieNodeCache = errors.New("trie node cache is disabled, nothing to save to file")
+var errSavingTrieNodeCacheInProgress = errors.New("saving trie node cache has been triggered already")
+
+// SaveTrieNodeCacheToFile saves the current cached trie nodes to file to reuse when the node restarts
+func (db *Database) SaveTrieNodeCacheToFile(filePath string) error {
+	if db.trieNodeCache == nil {
+		return errDisabledTrieNodeCache
+	}
+	if db.savingTrieNodeCacheTriggered {
+		return errSavingTrieNodeCacheInProgress
+	}
+	db.savingTrieNodeCacheTriggered = true
+	start := time.Now()
+	go func() {
+		logger.Info("start saving cache to file", "filePath", filePath)
+		if err := db.trieNodeCache.SaveToFile(filePath, runtime.NumCPU()/2); err != nil {
+			logger.Error("failed to save cache to file",
+				"filePath", filePath, "elapsed", time.Since(start), "err", err)
+		} else {
+			logger.Info("successfully saved cache to file",
+				"filePath", filePath, "elapsed", time.Since(start))
+		}
+		db.savingTrieNodeCacheTriggered = false
+	}()
+	return nil
 }

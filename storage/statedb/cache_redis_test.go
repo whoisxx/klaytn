@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,43 +28,92 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-var testHosts = []string{"localhost:6379"}
+func getTestRedisConfig() TrieNodeCacheConfig {
+	return TrieNodeCacheConfig{
+		CacheType:          CacheTypeRedis,
+		LocalCacheSizeMB:   1024 * 1024,
+		RedisEndpoints:     []string{"localhost:6379"},
+		RedisClusterEnable: false,
+	}
+}
 
 // TODO-Klaytn: Enable tests when redis is prepared on CI
 
+func _TestSubscription(t *testing.T) {
+	msg1 := "testMessage1"
+	msg2 := "testMessage2"
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	go func() {
+		cache, err := NewRedisCache(getTestRedisConfig())
+		assert.Nil(t, err)
+
+		ch := cache.SubscribeBlockCh()
+
+		actualMsg := <-ch
+		assert.Equal(t, msg1, actualMsg.Payload)
+
+		actualMsg = <-ch
+		assert.Equal(t, msg2, actualMsg.Payload)
+
+		wg.Done()
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	cache, err := NewRedisCache(getTestRedisConfig())
+	assert.Nil(t, err)
+
+	if err := cache.PublishBlock(msg1); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cache.PublishBlock(msg2); err != nil {
+		t.Fatal(err)
+	}
+
+	// to prevent continuous waiting
+	go func() {
+		time.Sleep(time.Second)
+		wg.Done()
+	}()
+
+	wg.Wait()
+}
+
 // TestNewRedisCache tests basic operations of redis cache
 func _TestNewRedisCache(t *testing.T) {
-	redis, err := NewRedisCache(testHosts, false)
+	cache, err := NewRedisCache(getTestRedisConfig())
 	assert.Nil(t, err)
 
 	key, value := randBytes(32), randBytes(500)
-	redis.Set(key, value)
+	cache.Set(key, value)
 
-	getValue := redis.Get(key)
+	getValue := cache.Get(key)
 	assert.Equal(t, bytes.Compare(value, getValue), 0)
 
-	hasValue, ok := redis.Has(key)
+	hasValue, ok := cache.Has(key)
 	assert.Equal(t, ok, true)
 	assert.Equal(t, bytes.Compare(value, hasValue), 0)
 }
 
 // TestNewRedisCache_Set_LargeData check whether redis cache can store an large data (5MB).
 func _TestNewRedisCache_Set_LargeData(t *testing.T) {
-	redis, err := NewRedisCache(testHosts, false)
+	cache, err := NewRedisCache(getTestRedisConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	key, value := randBytes(32), randBytes(5*1024*1024) // 5MB value
-	redis.Set(key, value)
+	cache.Set(key, value)
 
-	retValue := redis.Get(key)
+	retValue := cache.Get(key)
 	assert.Equal(t, bytes.Compare(value, retValue), 0)
 }
 
-// testNewRedisCache_Timeout test timout feature of redis client.
-// INFO: Enable it just when you want to test.
-func testNewRedisCache_Timeout(t *testing.T) {
+// TestNewRedisCache_Timeout test timout feature of redis client.
+func _TestNewRedisCache_Timeout(t *testing.T) {
 	go func() {
 		tcpAddr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:11234")
 		if err != nil {
@@ -90,25 +140,25 @@ func testNewRedisCache_Timeout(t *testing.T) {
 		}
 	}()
 
-	var redis TrieNodeCache = &RedisCache{redis.NewClient(&redis.Options{
+	var cache TrieNodeCache = &RedisCache{redis.NewClient(&redis.Options{
 		Addr:         "localhost:11234",
 		DialTimeout:  redisCacheDialTimeout,
 		ReadTimeout:  redisCacheTimeout,
 		WriteTimeout: redisCacheTimeout,
 		MaxRetries:   0,
-	})}
+	}), nil}
 
 	key, value := randBytes(32), randBytes(500)
 
 	start := time.Now()
-	redis.Set(key, value)
+	cache.Set(key, value)
 	assert.Equal(t, redisCacheTimeout, time.Since(start).Round(time.Second))
 
 	start = time.Now()
-	_ = redis.Get(key)
+	_ = cache.Get(key)
 	assert.Equal(t, redisCacheTimeout, time.Since(start).Round(time.Second))
 
 	start = time.Now()
-	_, _ = redis.Has(key)
+	_, _ = cache.Has(key)
 	assert.Equal(t, redisCacheTimeout, time.Since(start).Round(time.Second))
 }

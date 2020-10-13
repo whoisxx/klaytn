@@ -479,7 +479,8 @@ func defaultCacheConfig() *blockchain.CacheConfig {
 		TriesInMemory:    blockchain.DefaultTriesInMemory,
 		TrieNodeCacheConfig: statedb.TrieNodeCacheConfig{
 			CacheType:          statedb.CacheTypeLocal,
-			FastCacheSizeMB:    4096,
+			LocalCacheSizeMB:   4096,
+			FastCacheFileDir:   "",
 			RedisEndpoints:     nil,
 			RedisClusterEnable: false,
 		},

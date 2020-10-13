@@ -30,8 +30,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/klaytn/klaytn/storage/statedb"
-
 	"github.com/klaytn/klaytn/accounts"
 	"github.com/klaytn/klaytn/accounts/keystore"
 	"github.com/klaytn/klaytn/api/debug"
@@ -39,6 +37,7 @@ import (
 	"github.com/klaytn/klaytn/common"
 	"github.com/klaytn/klaytn/crypto"
 	"github.com/klaytn/klaytn/datasync/chaindatafetcher"
+	"github.com/klaytn/klaytn/datasync/chaindatafetcher/kafka"
 	"github.com/klaytn/klaytn/datasync/dbsyncer"
 	"github.com/klaytn/klaytn/datasync/downloader"
 	"github.com/klaytn/klaytn/log"
@@ -52,6 +51,7 @@ import (
 	"github.com/klaytn/klaytn/node/sc"
 	"github.com/klaytn/klaytn/params"
 	"github.com/klaytn/klaytn/storage/database"
+	"github.com/klaytn/klaytn/storage/statedb"
 	"gopkg.in/urfave/cli.v1"
 )
 
@@ -135,6 +135,10 @@ var (
 		Name:  "overwrite-genesis",
 		Usage: "Overwrites genesis block with the given new genesis block for testing purpose",
 	}
+	WorkerDisableFlag = cli.BoolFlag{
+		Name:  "worker.disable",
+		Usage: "Disables worker. This flag results in block processing failure.",
+	}
 	// Transaction pool settings
 	TxPoolNoLocalsFlag = cli.BoolFlag{
 		Name:  "txpool.nolocals",
@@ -192,6 +196,15 @@ var (
 		Name:  "txpool.lifetime",
 		Usage: "Maximum amount of time non-executable transaction are queued",
 		Value: cn.GetDefaultConfig().TxPool.Lifetime,
+	}
+	// block processing
+	DownloaderDisableFlag = cli.BoolFlag{
+		Name:  "downloader.disable",
+		Usage: "Disables downloader",
+	}
+	FetcherDisableFlag = cli.BoolFlag{
+		Name:  "fetcher.disable",
+		Usage: "Disables fetcher",
 	}
 	// Performance tuning settings
 	StateDBCachingFlag = cli.BoolFlag{
@@ -285,10 +298,6 @@ var (
 		Name:  "cache.memory",
 		Usage: "Set the physical RAM size (GB, Default: 16GB)",
 	}
-	CacheWriteThroughFlag = cli.BoolFlag{
-		Name:  "cache.writethrough",
-		Usage: "Enables write-through writing to database and cache for certain types of cache.",
-	}
 	TxPoolStateCacheFlag = cli.BoolFlag{
 		Name:  "statedb.use-txpool-cache",
 		Usage: "Enables caching of nonce and balance for txpool.",
@@ -306,6 +315,14 @@ var (
 	TrieNodeCacheRedisClusterFlag = cli.BoolFlag{
 		Name:  "statedb.cache.redis.cluster",
 		Usage: "Enables cluster-enabled mode of redis trie node cache",
+	}
+	TrieNodeCacheRedisPublishBlockFlag = cli.BoolFlag{
+		Name:  "statedb.cache.redis.publish",
+		Usage: "Publishes every committed block to redis trie node cache",
+	}
+	TrieNodeCacheRedisSubscribeBlockFlag = cli.BoolFlag{
+		Name:  "statedb.cache.redis.subscribe",
+		Usage: "Subscribes blocks from redis trie node cache",
 	}
 	TrieNodeCacheLimitFlag = cli.IntFlag{
 		Name:  "state.trie-cache-limit",
@@ -740,7 +757,40 @@ var (
 		Name:  "chaindatafetcher.kas.basic.auth.param",
 		Usage: "KAS specific header basic authorization parameter in chaindatafetcher",
 	}
-
+	ChainDataFetcherKafkaBrokersFlag = cli.StringSliceFlag{
+		Name:  "chaindatafetcher.kafka.brokers",
+		Usage: "Kafka broker URL list",
+	}
+	ChainDataFetcherKafkaTopicEnvironmentFlag = cli.StringFlag{
+		Name:  "chaindatafetcher.kafka.topic.environment",
+		Usage: "Kafka topic environment prefix",
+		Value: kafka.DefaultTopicEnvironmentName,
+	}
+	ChainDataFetcherKafkaTopicResourceFlag = cli.StringFlag{
+		Name:  "chaindatafetcher.kafka.topic.resource",
+		Usage: "Kafka topic resource name",
+		Value: kafka.DefaultTopicResourceName,
+	}
+	ChainDataFetcherKafkaReplicasFlag = cli.Int64Flag{
+		Name:  "chaindatafetcher.kafka.replicas",
+		Usage: "Kafka partition replication factor",
+		Value: kafka.DefaultReplicas,
+	}
+	ChainDataFetcherKafkaPartitionsFlag = cli.IntFlag{
+		Name:  "chaindatafetcher.kafka.partitions",
+		Usage: "The number of partitions in a topic",
+		Value: kafka.DefaultPartitions,
+	}
+	ChainDataFetcherKafkaMaxMessageBytesFlag = cli.Int64Flag{
+		Name:  "chaindatafetcher.kafka.max.message.bytes",
+		Usage: "The max size of a message produced by Kafka producer ",
+		Value: kafka.DefaultMaxMessageBytes,
+	}
+	ChainDataFetcherKafkaRequiredAcksFlag = cli.IntFlag{
+		Name:  "chaindatafetcher.kafka.required.acks",
+		Usage: "The level of acknowledgement reliability needed from Kafka broker (0: NoResponse, 1: WaitForLocal, -1: WaitForAll)",
+		Value: kafka.DefaultRequiredAcks,
+	}
 	// DBSyncer
 	EnableDBSyncerFlag = cli.BoolFlag{
 		Name:  "dbsyncer",
@@ -867,7 +917,7 @@ var (
 	}
 	DstDynamoDBTableNameFlag = cli.StringFlag{
 		Name:  "db.dst.dynamo.tablename",
-		Usage: "Specifies DynamoDB table name. This is mandatory to use dynamoDB. (Set dbtype to use DynamoDBS3)",
+		Usage: "Specifies DynamoDB table name. This is mandatory to use dynamoDB. (Set dbtype to use DynamoDBS3). If dstDB is singleDB, tableName should be in form of 'PREFIX-TABLENAME'.(e.g. 'klaytn-misc', 'klaytn-statetrie')",
 	}
 	DstDynamoDBRegionFlag = cli.StringFlag{
 		Name:  "db.dst.dynamo.region",
@@ -1342,6 +1392,10 @@ func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 		}
 	}
 
+	cfg.WorkerDisable = ctx.GlobalBool(WorkerDisableFlag.Name)
+	cfg.DownloaderDisable = ctx.GlobalBool(DownloaderDisableFlag.Name)
+	cfg.FetcherDisable = ctx.GlobalBool(FetcherDisableFlag.Name)
+
 	cfg.NetworkId, cfg.IsPrivate = getNetworkId(ctx)
 
 	if dbtype := database.DBType(ctx.GlobalString(DbTypeFlag.Name)).ToValid(); len(dbtype) != 0 {
@@ -1401,7 +1455,6 @@ func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 		logger.Debug("Memory settings", "PhysicalMemory(GB)", common.TotalPhysicalMemGB)
 	}
 
-	common.WriteThroughCaching = ctx.GlobalIsSet(CacheWriteThroughFlag.Name)
 	cfg.TxPoolStateCache = ctx.GlobalIsSet(TxPoolStateCacheFlag.Name)
 
 	if ctx.GlobalIsSet(DocRootFlag.Name) {
@@ -1417,9 +1470,12 @@ func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 	cfg.TrieNodeCacheConfig = statedb.TrieNodeCacheConfig{
 		CacheType: statedb.TrieNodeCacheType(ctx.GlobalString(TrieNodeCacheTypeFlag.
 			Name)).ToValid(),
-		FastCacheSizeMB:    ctx.GlobalInt(TrieNodeCacheLimitFlag.Name),
-		RedisEndpoints:     ctx.GlobalStringSlice(TrieNodeCacheRedisEndpointsFlag.Name),
-		RedisClusterEnable: ctx.GlobalBool(TrieNodeCacheRedisClusterFlag.Name),
+		LocalCacheSizeMB:          ctx.GlobalInt(TrieNodeCacheLimitFlag.Name),
+		FastCacheFileDir:          ctx.GlobalString(DataDirFlag.Name) + "/fastcache",
+		RedisEndpoints:            ctx.GlobalStringSlice(TrieNodeCacheRedisEndpointsFlag.Name),
+		RedisClusterEnable:        ctx.GlobalBool(TrieNodeCacheRedisClusterFlag.Name),
+		RedisPublishBlockEnable:   ctx.GlobalBool(TrieNodeCacheRedisPublishBlockFlag.Name),
+		RedisSubscribeBlockEnable: ctx.GlobalBool(TrieNodeCacheRedisSubscribeBlockFlag.Name),
 	}
 
 	if ctx.GlobalIsSet(VMEnableDebugFlag.Name) {

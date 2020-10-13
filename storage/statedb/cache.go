@@ -19,16 +19,21 @@ package statedb
 import (
 	"errors"
 	"strings"
+
+	"github.com/go-redis/redis/v7"
 )
 
 type TrieNodeCacheType string
 
 // TrieNodeCacheConfig contains configuration values of all TrieNodeCache.
 type TrieNodeCacheConfig struct {
-	CacheType          TrieNodeCacheType
-	FastCacheSizeMB    int      // Memory allowance (MB) to use for caching trie nodes in fast cache
-	RedisEndpoints     []string // Endpoints of redis cache
-	RedisClusterEnable bool     // Enable cluster-enabled mode of redis cache
+	CacheType                 TrieNodeCacheType
+	LocalCacheSizeMB          int      // Memory allowance (MB) to use for caching trie nodes in fast cache
+	FastCacheFileDir          string   // Directory where the persistent fastcache data is stored
+	RedisEndpoints            []string // Endpoints of redis cache
+	RedisClusterEnable        bool     // Enable cluster-enabled mode of redis cache
+	RedisPublishBlockEnable   bool     // Enable publishing every inserted block to the redis server
+	RedisSubscribeBlockEnable bool     // Enable subscribing blocks from the redis server
 }
 
 // TrieNodeCache interface the cache of stateDB
@@ -36,6 +41,15 @@ type TrieNodeCache interface {
 	Set(k, v []byte)
 	Get(k []byte) []byte
 	Has(k []byte) ([]byte, bool)
+	UpdateStats() interface{}
+	SaveToFile(filePath string, concurrency int) error
+	Close() error
+}
+
+type BlockPubSub interface {
+	PublishBlock(msg string) error
+	SubscribeBlockCh() <-chan *redis.Message
+	UnsubscribeBlock() error
 }
 
 const (
@@ -65,9 +79,9 @@ func (cacheType TrieNodeCacheType) ToValid() TrieNodeCacheType {
 func NewTrieNodeCache(config TrieNodeCacheConfig) (TrieNodeCache, error) {
 	switch config.CacheType {
 	case CacheTypeLocal:
-		return NewFastCache(config.FastCacheSizeMB), nil
+		return NewFastCache(config), nil
 	case CacheTypeRedis:
-		return NewRedisCache(config.RedisEndpoints, config.RedisClusterEnable)
+		return NewRedisCache(config)
 	case CacheTypeHybrid:
 		logger.Info("Set hybrid trie node cache using both of localCache (fastCache) and redisCache")
 		return NewHybridCache(config)
@@ -80,7 +94,8 @@ func NewTrieNodeCache(config TrieNodeCacheConfig) (TrieNodeCache, error) {
 func GetEmptyTrieNodeCacheConfig() TrieNodeCacheConfig {
 	return TrieNodeCacheConfig{
 		CacheType:          CacheTypeLocal,
-		FastCacheSizeMB:    0,
+		LocalCacheSizeMB:   0,
+		FastCacheFileDir:   "",
 		RedisEndpoints:     nil,
 		RedisClusterEnable: false,
 	}

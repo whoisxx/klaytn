@@ -24,6 +24,11 @@ import (
 	"github.com/klaytn/klaytn/common/hexutil"
 )
 
+const (
+	redisSubscriptionChannelSize  = 100 // default value of redis client
+	redisSubscriptionChannelBlock = "latestBlock"
+)
+
 var (
 	redisCacheDialTimeout = time.Duration(300 * time.Millisecond)
 	redisCacheTimeout     = time.Duration(100 * time.Millisecond)
@@ -33,6 +38,7 @@ var (
 
 type RedisCache struct {
 	client redis.UniversalClient
+	pubSub *redis.PubSub
 }
 
 func newRedisClient(endpoints []string, isCluster bool) (redis.UniversalClient, error) {
@@ -62,16 +68,17 @@ func newRedisClient(endpoints []string, isCluster bool) (redis.UniversalClient, 
 	}), nil
 }
 
-func NewRedisCache(endpoints []string, isCluster bool) (*RedisCache, error) {
-	cli, err := newRedisClient(endpoints, isCluster)
+func NewRedisCache(config TrieNodeCacheConfig) (*RedisCache, error) {
+	cli, err := newRedisClient(config.RedisEndpoints, config.RedisClusterEnable)
 	if err != nil {
-		logger.Error("failed to create a redis client", "err", err, "endpoint", endpoints,
-			"isCluster", isCluster)
+		logger.Error("failed to create a redis client", "err", err, "endpoint", config.RedisEndpoints,
+			"isCluster", config.RedisClusterEnable)
 		return nil, err
 	}
 
-	logger.Info("Initialize trie node cache with redis", "endpoint", endpoints, "isCluster", isCluster)
-	return &RedisCache{client: cli}, nil
+	logger.Info("Initialize trie node cache with redis", "endpoint", config.RedisEndpoints,
+		"isCluster", config.RedisClusterEnable)
+	return &RedisCache{client: cli, pubSub: nil}, nil
 }
 
 func (cache *RedisCache) Get(k []byte) []byte {
@@ -96,4 +103,47 @@ func (cache *RedisCache) Has(k []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return val, true
+}
+
+func (cache *RedisCache) publish(channel string, msg string) error {
+	return cache.client.Publish(channel, msg).Err()
+}
+
+// subscribe subscribes the redis client to the given channel.
+// It returns an existing *redis.PubSub subscribing previously registered channels also.
+func (cache *RedisCache) subscribe(channel string) *redis.PubSub {
+	if cache.pubSub == nil {
+		cache.pubSub = cache.client.Subscribe()
+	}
+	if err := cache.pubSub.Subscribe(channel); err != nil {
+		logger.Error("failed to subscribe channel", "err", err, "channel", channel)
+	}
+	return cache.pubSub
+}
+
+func (cache *RedisCache) PublishBlock(msg string) error {
+	return cache.publish(redisSubscriptionChannelBlock, msg)
+}
+
+func (cache *RedisCache) SubscribeBlockCh() <-chan *redis.Message {
+	return cache.subscribe(redisSubscriptionChannelBlock).ChannelSize(redisSubscriptionChannelSize)
+}
+
+func (cache *RedisCache) UnsubscribeBlock() error {
+	if cache.pubSub == nil {
+		return nil
+	}
+	return cache.pubSub.Unsubscribe(redisSubscriptionChannelBlock)
+}
+
+func (cache *RedisCache) UpdateStats() interface{} {
+	return nil
+}
+
+func (cache *RedisCache) SaveToFile(filePath string, concurrency int) error {
+	return nil
+}
+
+func (cache *RedisCache) Close() error {
+	return cache.client.Close()
 }
