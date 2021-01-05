@@ -36,6 +36,7 @@ var CommonNodeFlags = []cli.Flag{
 	utils.DbTypeFlag,
 	utils.DataDirFlag,
 	utils.OverwriteGenesisFlag,
+	utils.StartBlockNumberFlag,
 	utils.KeyStoreDirFlag,
 	utils.TxPoolNoLocalsFlag,
 	utils.TxPoolAllowLocalAnchorTxFlag,
@@ -52,11 +53,11 @@ var CommonNodeFlags = []cli.Flag{
 	utils.SyncModeFlag,
 	utils.GCModeFlag,
 	utils.LightKDFFlag,
-	utils.StateDBCachingFlag,
 	utils.SingleDBFlag,
 	utils.NumStateTrieShardsFlag,
 	utils.LevelDBCompressionTypeFlag,
 	utils.LevelDBNoBufferPoolFlag,
+	utils.DBNoPerformanceMetricsFlag,
 	utils.DynamoDBTableNameFlag,
 	utils.DynamoDBRegionFlag,
 	utils.DynamoDBIsProvisionedFlag,
@@ -73,7 +74,6 @@ var CommonNodeFlags = []cli.Flag{
 	utils.CacheScaleFlag,
 	utils.CacheUsageLevelFlag,
 	utils.MemorySizeFlag,
-	utils.TxPoolStateCacheFlag,
 	utils.TrieNodeCacheTypeFlag,
 	utils.TrieNodeCacheLimitFlag,
 	utils.TrieNodeCacheRedisEndpointsFlag,
@@ -109,9 +109,6 @@ var CommonNodeFlags = []cli.Flag{
 	utils.RestartTimeOutFlag,
 	utils.DaemonPathFlag,
 	utils.ConfigFileFlag,
-	utils.WorkerDisableFlag,
-	utils.DownloaderDisableFlag,
-	utils.FetcherDisableFlag,
 }
 
 // Common RPC flags
@@ -120,6 +117,7 @@ var CommonRPCFlags = []cli.Flag{
 	utils.RPCListenAddrFlag,
 	utils.RPCPortFlag,
 	utils.RPCApiFlag,
+	utils.RPCGlobalGasCap,
 	utils.WSEnabledFlag,
 	utils.WSListenAddrFlag,
 	utils.WSPortFlag,
@@ -153,6 +151,7 @@ var KENFlags = []cli.Flag{
 	utils.ChildChainIndexingFlag,
 	utils.MainBridgeFlag,
 	utils.MainBridgeListenPortFlag,
+	utils.KESNodeTypeServiceFlag,
 	// ChainDataFetcher
 	utils.EnableChainDataFetcherFlag,
 	utils.ChainDataFetcherMode,
@@ -264,6 +263,7 @@ var KSENFlags = []cli.Flag{
 	utils.VTRecoveryFlag,
 	utils.VTRecoveryIntervalFlag,
 	utils.ServiceChainAnchoringFlag,
+	utils.KESNodeTypeServiceFlag,
 	// KAS
 	utils.KASServiceChainAnchorFlag,
 	utils.KASServiceChainAnchorPeriodFlag,

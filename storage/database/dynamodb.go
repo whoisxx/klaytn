@@ -27,25 +27,26 @@ package database
 
 import (
 	"bytes"
-	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/session"
-
-	"github.com/rcrowley/go-metrics"
-
-	"github.com/pkg/errors"
-
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+	"github.com/klaytn/klaytn/common/hexutil"
 	"github.com/klaytn/klaytn/log"
+	"github.com/pkg/errors"
+	"github.com/rcrowley/go-metrics"
 )
 
 var overSizedDataPrefix = []byte("oversizeditem")
+
+// Performance of batch operations of DynamoDB are collected by default.
+var dynamoBatchWriteTimeMeter metrics.Meter = &metrics.NilMeter{}
 
 // errors
 var dataNotFoundErr = errors.New("data is not found with the given key")
@@ -56,6 +57,7 @@ var noTableNameErr = errors.New("dynamoDB table name not provided")
 const dynamoWriteSizeLimit = 399 * 1024 // The maximum write size is 400KB including attribute names and values
 const dynamoBatchSize = 25
 const dynamoMaxRetry = 5
+const dynamoTimeout = 10 * time.Second
 
 // batch write
 const WorkerNum = 10
@@ -77,6 +79,7 @@ type DynamoDBConfig struct {
 	ReadCapacityUnits  int64  // read capacity when provisioned
 	WriteCapacityUnits int64  // write capacity when provisioned
 	ReadOnly           bool   // disables write
+	PerfCheck          bool
 }
 
 type batchWriteWorkerInput struct {
@@ -92,11 +95,8 @@ type dynamoDB struct {
 	logger log.Logger // Contextual logger tracking the database path
 
 	// metrics
-	batchWriteTimeMeter       metrics.Meter
-	batchWriteCountMeter      metrics.Meter
-	batchWriteSizeMeter       metrics.Meter
-	batchWriteSecPerItemMeter metrics.Meter
-	batchWriteSecPerByteMeter metrics.Meter
+	getTimer metrics.Timer
+	putTimer metrics.Timer
 }
 
 type DynamoData struct {
@@ -119,23 +119,7 @@ func GetDefaultDynamoDBConfig() *DynamoDBConfig {
 		ReadCapacityUnits:  10000,
 		WriteCapacityUnits: 10000,
 		ReadOnly:           false,
-	}
-}
-
-// GetTestDynamoConfig gets dynamo config for local test
-//
-// Please Run DynamoDB local with docker
-//    $ docker run -d -p 4566:4566 localstack/localstack:0.11.5
-func GetTestDynamoConfig() *DynamoDBConfig {
-	return &DynamoDBConfig{
-		Region:             "us-east-1",
-		Endpoint:           "http://localhost:4566",
-		S3Endpoint:         "http://localhost:4566",
-		TableName:          "klaytn-default" + strconv.Itoa(time.Now().Nanosecond()),
-		IsProvisioned:      false,
-		ReadCapacityUnits:  10000,
-		WriteCapacityUnits: 10000,
-		ReadOnly:           false,
+		PerfCheck:          true,
 	}
 }
 
@@ -176,6 +160,8 @@ func newDynamoDB(config *DynamoDBConfig) (*dynamoDB, error) {
 				Endpoint:         aws.String(config.Endpoint),
 				Region:           aws.String(config.Region),
 				S3ForcePathStyle: aws.Bool(true),
+				MaxRetries:       aws.Int(dynamoMaxRetry),
+				HTTPClient:       &http.Client{Timeout: dynamoTimeout}, // default client is &http.Client{}
 			},
 		})))
 	}
@@ -196,7 +182,8 @@ func newDynamoDB(config *DynamoDBConfig) (*dynamoDB, error) {
 				return nil, err
 			}
 
-			dynamoDB.logger.Info("creating a DynamoDB table", "endPoint", config.Endpoint)
+			dynamoDB.logger.Warn("creating a DynamoDB table. You will be CHARGED until the DB is deleted",
+				"endPoint", config.Endpoint)
 			if err := dynamoDB.createTable(); err != nil {
 				dynamoDB.logger.Error("unable to create a DynamoDB table", "err", err.Error())
 				return nil, err
@@ -205,7 +192,6 @@ func newDynamoDB(config *DynamoDBConfig) (*dynamoDB, error) {
 
 		switch tableStatus {
 		case dynamodb.TableStatusActive:
-			dynamoDB.logger.Warn("Successfully created dynamoDB table. You will be CHARGED until the DB is deleted.", "endPoint", config.Endpoint)
 			if !dynamoDB.config.ReadOnly {
 				// count successful table creating
 				dynamoOpenedDBNum++
@@ -214,6 +200,7 @@ func newDynamoDB(config *DynamoDBConfig) (*dynamoDB, error) {
 					createBatchWriteWorkerPool(config.Endpoint, config.Region)
 				})
 			}
+			dynamoDB.logger.Info("successfully created dynamoDB session", "endPoint", config.Endpoint)
 			return dynamoDB, nil
 		case dynamodb.TableStatusDeleting, dynamodb.TableStatusArchiving, dynamodb.TableStatusArchived:
 			return nil, errors.New("failed to get DynamoDB table, table status : " + tableStatus)
@@ -294,6 +281,16 @@ func (dynamo *dynamoDB) Type() DBType {
 
 // Put inserts the given key and value pair to the database.
 func (dynamo *dynamoDB) Put(key []byte, val []byte) error {
+	if dynamo.config.PerfCheck {
+		start := time.Now()
+		err := dynamo.put(key, val)
+		dynamo.putTimer.Update(time.Since(start))
+		return err
+	}
+	return dynamo.put(key, val)
+}
+
+func (dynamo *dynamoDB) put(key []byte, val []byte) error {
 	if len(key) == 0 {
 		return nil
 	}
@@ -319,7 +316,7 @@ func (dynamo *dynamoDB) Put(key []byte, val []byte) error {
 
 	_, err = dynamoDBClient.PutItem(params)
 	if err != nil {
-		fmt.Printf("Put ERROR: %v\n", err.Error())
+		dynamo.logger.Error("failed to put an item", "err", err, "key", hexutil.Encode(data.Key))
 		return err
 	}
 
@@ -336,6 +333,16 @@ func (dynamo *dynamoDB) Has(key []byte) (bool, error) {
 
 // Get returns the corresponding value to the given key if exists.
 func (dynamo *dynamoDB) Get(key []byte) ([]byte, error) {
+	if dynamo.config.PerfCheck {
+		start := time.Now()
+		val, err := dynamo.get(key)
+		dynamo.getTimer.Update(time.Since(start))
+		return val, err
+	}
+	return dynamo.get(key)
+}
+
+func (dynamo *dynamoDB) get(key []byte) ([]byte, error) {
 	params := &dynamodb.GetItemInput{
 		TableName: aws.String(dynamo.config.TableName),
 		Key: map[string]*dynamodb.AttributeValue{
@@ -348,7 +355,7 @@ func (dynamo *dynamoDB) Get(key []byte) ([]byte, error) {
 
 	result, err := dynamoDBClient.GetItem(params)
 	if err != nil {
-		fmt.Printf("Get ERROR: %v\n", err.Error())
+		dynamo.logger.Error("failed to get an item", "err", err, "key", hexutil.Encode(key))
 		return nil, err
 	}
 
@@ -385,7 +392,7 @@ func (dynamo *dynamoDB) Delete(key []byte) error {
 
 	_, err := dynamoDBClient.DeleteItem(params)
 	if err != nil {
-		fmt.Printf("ERROR: %v\n", err.Error())
+		dynamo.logger.Error("failed to delete an item", "err", err, "key", hexutil.Encode(key))
 		return err
 	}
 	return nil
@@ -401,12 +408,9 @@ func (dynamo *dynamoDB) Close() {
 }
 
 func (dynamo *dynamoDB) Meter(prefix string) {
-	// TODO-Klaytn: implement this later. Consider the return values of bathItemWrite
-	dynamo.batchWriteTimeMeter = metrics.NewRegisteredMeter(prefix+"batchwrite/time", nil)
-	dynamo.batchWriteCountMeter = metrics.NewRegisteredMeter(prefix+"batchwrite/count", nil)
-	dynamo.batchWriteSizeMeter = metrics.NewRegisteredMeter(prefix+"batchwrite/size", nil)
-	dynamo.batchWriteSecPerItemMeter = metrics.NewRegisteredMeter(prefix+"batchwrite/secperitem", nil)
-	dynamo.batchWriteSecPerByteMeter = metrics.NewRegisteredMeter(prefix+"batchwrite/secperbyte", nil)
+	dynamo.getTimer = metrics.NewRegisteredTimer(prefix+"get/time", nil)
+	dynamo.putTimer = metrics.NewRegisteredTimer(prefix+"put/time", nil)
+	dynamoBatchWriteTimeMeter = metrics.NewRegisteredMeter(prefix+"batchwrite/time", nil)
 }
 
 func (dynamo *dynamoDB) NewIterator() Iterator {
@@ -470,7 +474,9 @@ func createBatchWriteWorker(writeCh <-chan *batchWriteWorkerInput) {
 				batchWriteInput.RequestItems[batchInput.tableName] = BatchWriteItemOutput.UnprocessedItems[batchInput.tableName]
 			}
 
+			start := time.Now()
 			BatchWriteItemOutput, err = dynamoDBClient.BatchWriteItem(batchWriteInput)
+			dynamoBatchWriteTimeMeter.Mark(int64(time.Since(start)))
 			numUnprocessed = len(BatchWriteItemOutput.UnprocessedItems)
 		}
 

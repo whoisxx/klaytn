@@ -120,19 +120,19 @@ var goodVotes = []voteValue{
 
 func getTestConfig() *params.ChainConfig {
 	config := params.TestChainConfig
-	config.Governance = GetDefaultGovernanceConfig(params.UseIstanbul)
-	config.Istanbul = GetDefaultIstanbulConfig()
+	config.Governance = params.GetDefaultGovernanceConfig(params.UseIstanbul)
+	config.Istanbul = params.GetDefaultIstanbulConfig()
 	return config
 }
 
 func getGovernance() *Governance {
 	dbm := database.NewDBManager(&database.DBConfig{DBType: database.MemoryDB})
 	config := getTestConfig()
-	return NewGovernance(config, dbm)
+	return NewGovernanceInitialize(config, dbm)
 }
 
 func TestGetDefaultGovernanceConfig(t *testing.T) {
-	tstGovernance := GetDefaultGovernanceConfig(params.UseIstanbul)
+	tstGovernance := params.GetDefaultGovernanceConfig(params.UseIstanbul)
 
 	want := []interface{}{
 		params.DefaultUseGiniCoeff,
@@ -684,7 +684,7 @@ func TestGovernance_HandleGovernanceVote_Ballot_mode(t *testing.T) {
 	config := getTestConfig()
 	config.Governance.GovernanceMode = GovernanceModeBallot
 	dbm := database.NewDBManager(&database.DBConfig{DBType: database.MemoryDB})
-	gov := NewGovernance(config, dbm)
+	gov := NewGovernanceInitialize(config, dbm)
 	gov.nodeAddress.Store(council[len(council)-1])
 
 	votes := make([]GovernanceVote, 0)

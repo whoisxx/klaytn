@@ -360,6 +360,11 @@ web3._extend({
 			call: 'debug_stopWarmUp',
 		}),
 		new web3._extend.Method({
+			name: 'startCollectingTrieStats',
+			call: 'debug_startCollectingTrieStats',
+			params: 1,
+		}),
+		new web3._extend.Method({
 			name: 'chaindbProperty',
 			call: 'debug_chaindbProperty',
 			params: 1,
@@ -581,6 +586,12 @@ web3._extend({
 			call: 'debug_getModifiedAccountsByHash',
 			params: 2,
 			inputFormatter:[null, null],
+		}),
+		new web3._extend.Method({
+			name: 'getModifiedStorageNodesByNumber',
+			call: 'debug_getModifiedStorageNodesByNumber',
+			params: 4,
+			inputFormatter: [null, null, null, null],
 		}),
 		new web3._extend.Method({
 			name: 'setVMLogTarget',

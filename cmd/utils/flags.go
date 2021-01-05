@@ -24,6 +24,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"io/ioutil"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,6 +36,7 @@ import (
 	"github.com/klaytn/klaytn/api/debug"
 	"github.com/klaytn/klaytn/blockchain"
 	"github.com/klaytn/klaytn/common"
+	"github.com/klaytn/klaytn/common/fdlimit"
 	"github.com/klaytn/klaytn/crypto"
 	"github.com/klaytn/klaytn/datasync/chaindatafetcher"
 	"github.com/klaytn/klaytn/datasync/chaindatafetcher/kafka"
@@ -135,9 +137,9 @@ var (
 		Name:  "overwrite-genesis",
 		Usage: "Overwrites genesis block with the given new genesis block for testing purpose",
 	}
-	WorkerDisableFlag = cli.BoolFlag{
-		Name:  "worker.disable",
-		Usage: "Disables worker. This flag results in block processing failure.",
+	StartBlockNumberFlag = cli.Uint64Flag{
+		Name:  "start-block-num",
+		Usage: "Starts the node from the given block number. Starting from 0 is not supported.",
 	}
 	// Transaction pool settings
 	TxPoolNoLocalsFlag = cli.BoolFlag{
@@ -197,19 +199,10 @@ var (
 		Usage: "Maximum amount of time non-executable transaction are queued",
 		Value: cn.GetDefaultConfig().TxPool.Lifetime,
 	}
-	// block processing
-	DownloaderDisableFlag = cli.BoolFlag{
-		Name:  "downloader.disable",
-		Usage: "Disables downloader",
-	}
-	FetcherDisableFlag = cli.BoolFlag{
-		Name:  "fetcher.disable",
-		Usage: "Disables fetcher",
-	}
-	// Performance tuning settings
-	StateDBCachingFlag = cli.BoolFlag{
-		Name:  "statedb.use-cache",
-		Usage: "Enables caching of state objects in stateDB",
+	// KES
+	KESNodeTypeServiceFlag = cli.BoolFlag{
+		Name:  "kes.nodetype.service",
+		Usage: "Run as a KES Service Node (Disable fetcher, downloader, and worker)",
 	}
 	SingleDBFlag = cli.BoolFlag{
 		Name:  "db.single",
@@ -266,6 +259,10 @@ var (
 		Name:  "db.no-parallel-write",
 		Usage: "Disables parallel writes of block data to persistent database",
 	}
+	DBNoPerformanceMetricsFlag = cli.BoolFlag{
+		Name:  "db.no-perf-metrics",
+		Usage: "Disables performance metrics of database's read and write operations",
+	}
 	TrieMemoryCacheSizeFlag = cli.IntFlag{
 		Name:  "state.cache-size",
 		Usage: "Size of in-memory cache of the global state (in MiB) to flush matured singleton trie nodes to disk",
@@ -297,10 +294,6 @@ var (
 	MemorySizeFlag = cli.IntFlag{
 		Name:  "cache.memory",
 		Usage: "Set the physical RAM size (GB, Default: 16GB)",
-	}
-	TxPoolStateCacheFlag = cli.BoolFlag{
-		Name:  "statedb.use-txpool-cache",
-		Usage: "Enables caching of nonce and balance for txpool.",
 	}
 	TrieNodeCacheTypeFlag = cli.StringFlag{
 		Name: "statedb.cache.type",
@@ -441,6 +434,10 @@ var (
 		Name:  "rpcapi",
 		Usage: "API's offered over the HTTP-RPC interface",
 		Value: "",
+	}
+	RPCGlobalGasCap = cli.Uint64Flag{
+		Name:  "rpc.gascap",
+		Usage: "Sets a cap on gas that can be used in klay_call/estimateGas",
 	}
 	IPCDisabledFlag = cli.BoolFlag{
 		Name:  "ipcdisable",
@@ -1380,10 +1377,26 @@ func checkExclusive(ctx *cli.Context, args ...interface{}) {
 	}
 }
 
+// raiseFDLimit increases the file descriptor limit to process's maximum value
+func raiseFDLimit() {
+	limit, err := fdlimit.Maximum()
+	if err != nil {
+		logger.Error("Failed to read maximum fd. you may suffer fd exhaustion", "err", err)
+		return
+	}
+	raised, err := fdlimit.Raise(uint64(limit))
+	if err != nil {
+		logger.Warn("Failed to increase fd limit. you may suffer fd exhaustion", "err", err)
+		return
+	}
+	logger.Info("Raised fd limit to process's maximum value", "fd", raised)
+}
+
 // SetKlayConfig applies klay-related command line flags to the config.
 func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 	// TODO-Klaytn-Bootnode: better have to check conflicts about network flags when we add Klaytn's `mainnet` parameter
 	// checkExclusive(ctx, DeveloperFlag, TestnetFlag, RinkebyFlag)
+	raiseFDLimit()
 
 	ks := stack.AccountManager().Backends(keystore.KeyStoreType)[0].(*keystore.KeyStore)
 	setServiceChainSigner(ctx, ks, cfg)
@@ -1397,9 +1410,11 @@ func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 		}
 	}
 
-	cfg.WorkerDisable = ctx.GlobalBool(WorkerDisableFlag.Name)
-	cfg.DownloaderDisable = ctx.GlobalBool(DownloaderDisableFlag.Name)
-	cfg.FetcherDisable = ctx.GlobalBool(FetcherDisableFlag.Name)
+	if ctx.GlobalBool(KESNodeTypeServiceFlag.Name) {
+		cfg.FetcherDisable = true
+		cfg.DownloaderDisable = true
+		cfg.WorkerDisable = true
+	}
 
 	cfg.NetworkId, cfg.IsPrivate = getNetworkId(ctx)
 
@@ -1415,9 +1430,11 @@ func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 	}
 
 	cfg.OverwriteGenesis = ctx.GlobalBool(OverwriteGenesisFlag.Name)
+	cfg.StartBlockNumber = ctx.GlobalUint64(StartBlockNumberFlag.Name)
 
 	cfg.LevelDBCompression = database.LevelDBCompressionType(ctx.GlobalInt(LevelDBCompressionTypeFlag.Name))
 	cfg.LevelDBBufferPool = !ctx.GlobalIsSet(LevelDBNoBufferPoolFlag.Name)
+	cfg.EnableDBPerfMetrics = !ctx.GlobalIsSet(DBNoPerformanceMetricsFlag.Name)
 	cfg.LevelDBCacheSize = ctx.GlobalInt(LevelDBCacheSizeFlag.Name)
 
 	cfg.DynamoDBConfig.TableName = ctx.GlobalString(DynamoDBTableNameFlag.Name)
@@ -1460,8 +1477,6 @@ func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 		logger.Debug("Memory settings", "PhysicalMemory(GB)", common.TotalPhysicalMemGB)
 	}
 
-	cfg.TxPoolStateCache = ctx.GlobalIsSet(TxPoolStateCacheFlag.Name)
-
 	if ctx.GlobalIsSet(DocRootFlag.Name) {
 		cfg.DocRoot = ctx.GlobalString(DocRootFlag.Name)
 	}
@@ -1471,7 +1486,6 @@ func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 
 	cfg.SenderTxHashIndexing = ctx.GlobalIsSet(SenderTxHashIndexingFlag.Name)
 	cfg.ParallelDBWrite = !ctx.GlobalIsSet(NoParallelDBWriteFlag.Name)
-	cfg.StateDBCaching = ctx.GlobalIsSet(StateDBCachingFlag.Name)
 	cfg.TrieNodeCacheConfig = statedb.TrieNodeCacheConfig{
 		CacheType: statedb.TrieNodeCacheType(ctx.GlobalString(TrieNodeCacheTypeFlag.
 			Name)).ToValid(),
@@ -1497,6 +1511,10 @@ func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 	cfg.AutoRestartFlag = ctx.GlobalBool(AutoRestartFlag.Name)
 	cfg.RestartTimeOutFlag = ctx.GlobalDuration(RestartTimeOutFlag.Name)
 	cfg.DaemonPathFlag = ctx.GlobalString(DaemonPathFlag.Name)
+
+	if ctx.GlobalIsSet(RPCGlobalGasCap.Name) {
+		cfg.RPCGasCap = new(big.Int).SetUint64(ctx.GlobalUint64(RPCGlobalGasCap.Name))
+	}
 
 	// Override any default configs for hard coded network.
 	// TODO-Klaytn-Bootnode: Discuss and add `baobab` test network's genesis block

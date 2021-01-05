@@ -317,7 +317,12 @@ func (f *ChainDataFetcher) setCheckpoint() {
 	if err != nil {
 		logger.Crit("ReadCheckpoint is failed", "err", err)
 	}
+
+	if checkpoint == 0 {
+		checkpoint = f.blockchain.CurrentHeader().Number.Int64()
+	}
 	f.checkpoint = checkpoint
+	logger.Info("Chaindatafetcher initial checkpoint is set", "checkpoint", f.checkpoint)
 }
 
 func (f *ChainDataFetcher) setComponent(component interface{}) {
@@ -352,7 +357,10 @@ func (f *ChainDataFetcher) handleRequestByType(reqType cfTypes.RequestType, shou
 	// - RequestTypeTraceGroup
 	for targetType := cfTypes.RequestTypeTransaction; targetType < cfTypes.RequestTypeLength; targetType = targetType << 1 {
 		if cfTypes.CheckRequestType(reqType, targetType) {
-			f.updateInsertionTimeGauge(f.retryFunc(f.repo.HandleChainEvent))(ev, targetType)
+			if err := f.updateInsertionTimeGauge(f.retryFunc(f.repo.HandleChainEvent))(ev, targetType); err != nil {
+				logger.Error("the chaindatafetcher is stopped by user while an error is occurring", "blockNumber", ev.Block.NumberU64(), "err", err)
+				return
+			}
 		}
 	}
 	elapsed := time.Since(now)
@@ -478,7 +486,7 @@ func (f *ChainDataFetcher) retryFunc(insert HandleChainEventFn) HandleChainEvent
 		for err := insert(event, reqType); err != nil; err = insert(event, reqType) {
 			select {
 			case <-f.stopCh:
-				return nil
+				return err
 			default:
 				i++
 				gauge := getInsertionRetryGauge(reqType)

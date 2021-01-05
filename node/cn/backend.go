@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/klaytn/klaytn"
 	"github.com/klaytn/klaytn/accounts"
@@ -216,7 +217,7 @@ func New(ctx *node.ServiceContext, config *Config) (*CN, error) {
 	config.GasPrice = new(big.Int).SetUint64(chainConfig.UnitPrice)
 
 	logger.Info("Initialised chain configuration", "config", chainConfig)
-	governance := governance.NewGovernance(chainConfig, chainDB)
+	governance := governance.NewGovernanceInitialize(chainConfig, chainDB)
 
 	cn := &CN{
 		config:            config,
@@ -248,9 +249,8 @@ func New(ctx *node.ServiceContext, config *Config) (*CN, error) {
 	}
 	var (
 		vmConfig    = config.getVMConfig()
-		cacheConfig = &blockchain.CacheConfig{StateDBCaching: config.StateDBCaching,
-			ArchiveMode: config.NoPruning, CacheSize: config.TrieCacheSize, BlockInterval: config.TrieBlockInterval,
-			TriesInMemory: config.TriesInMemory, TxPoolStateCache: config.TxPoolStateCache,
+		cacheConfig = &blockchain.CacheConfig{ArchiveMode: config.NoPruning, CacheSize: config.TrieCacheSize,
+			BlockInterval: config.TrieBlockInterval, TriesInMemory: config.TriesInMemory,
 			TrieNodeCacheConfig: config.TrieNodeCacheConfig, SenderTxHashIndexing: config.SenderTxHashIndexing}
 	)
 
@@ -258,6 +258,8 @@ func New(ctx *node.ServiceContext, config *Config) (*CN, error) {
 	if err != nil {
 		return nil, err
 	}
+	bc.SetCanonicalBlock(config.StartBlockNumber)
+
 	cn.blockchain = bc
 	governance.SetBlockchain(cn.blockchain)
 	// Synchronize proposerpolicy & useGiniCoeff
@@ -315,21 +317,10 @@ func New(ctx *node.ServiceContext, config *Config) (*CN, error) {
 
 	// set worker
 	if config.WorkerDisable {
-		// TODO Klaytn: implement auto restart when the fake worker is used
 		cn.miner = work.NewFakeWorker()
 	} else {
-		var restartFn func()
-		if config.AutoRestartFlag {
-			restartFn = func() {
-				daemonPath := config.DaemonPathFlag
-				logger.Warn("Restart node", "command", daemonPath+" restart")
-				cmd := exec.Command(daemonPath, "restart")
-				cmd.Run()
-			}
-		}
-
 		// TODO-Klaytn improve to handle drop transaction on network traffic in PN and EN
-		cn.miner = work.New(cn, cn.chainConfig, cn.EventMux(), cn.engine, ctx.NodeType(), crypto.PubkeyToAddress(ctx.NodeKey().PublicKey), cn.config.TxResendUseLegacy, config.RestartTimeOutFlag, restartFn)
+		cn.miner = work.New(cn, cn.chainConfig, cn.EventMux(), cn.engine, ctx.NodeType(), crypto.PubkeyToAddress(ctx.NodeKey().PublicKey), cn.config.TxResendUseLegacy)
 	}
 
 	// istanbul BFT
@@ -349,6 +340,36 @@ func New(ctx *node.ServiceContext, config *Config) (*CN, error) {
 	cn.addComponent(cn.txPool)
 	cn.addComponent(cn.APIs())
 	cn.addComponent(cn.ChainDB())
+
+	if config.AutoRestartFlag {
+		daemonPath := config.DaemonPathFlag
+		restartInterval := config.RestartTimeOutFlag
+		if restartInterval <= time.Second {
+			logger.Crit("Invalid auto-restart timeout", "timeout", restartInterval)
+		}
+
+		// Restarts the node with the same configuration if blockNumber is not changed for a specific time.
+		restartTimer := time.AfterFunc(restartInterval, func() {
+			logger.Warn("Restart node", "command", daemonPath+" restart")
+			cmd := exec.Command(daemonPath, "restart")
+			cmd.Run()
+		})
+		logger.Info("Initialize auto-restart feature", "timeout", restartInterval)
+
+		go func() {
+			blockChecker := time.NewTicker(time.Second)
+			prevBlockNum := cn.blockchain.CurrentBlock().NumberU64()
+
+			for range blockChecker.C {
+				currentBlockNum := cn.blockchain.CurrentBlock().NumberU64()
+
+				if prevBlockNum != currentBlockNum {
+					prevBlockNum = currentBlockNum
+					restartTimer.Reset(restartInterval)
+				}
+			}
+		}()
+	}
 
 	// Only for KES nodes
 	if config.TrieNodeCacheConfig.RedisSubscribeBlockEnable {
@@ -422,7 +443,7 @@ func makeExtraData(extra []byte) []byte {
 func CreateDB(ctx *node.ServiceContext, config *Config, name string) database.DBManager {
 	dbc := &database.DBConfig{Dir: name, DBType: config.DBType, ParallelDBWrite: config.ParallelDBWrite, SingleDB: config.SingleDB, NumStateTrieShards: config.NumStateTrieShards,
 		LevelDBCacheSize: config.LevelDBCacheSize, OpenFilesLimit: database.GetOpenFilesLimit(), LevelDBCompression: config.LevelDBCompression,
-		LevelDBBufferPool: config.LevelDBBufferPool, DynamoDBConfig: &config.DynamoDBConfig}
+		LevelDBBufferPool: config.LevelDBBufferPool, EnableDBPerfMetrics: config.EnableDBPerfMetrics, DynamoDBConfig: &config.DynamoDBConfig}
 	return ctx.OpenDatabase(dbc)
 }
 
@@ -430,7 +451,7 @@ func CreateDB(ctx *node.ServiceContext, config *Config, name string) database.DB
 func CreateConsensusEngine(ctx *node.ServiceContext, config *Config, chainConfig *params.ChainConfig, db database.DBManager, gov *governance.Governance, nodetype common.ConnType) consensus.Engine {
 	// Only istanbul  BFT is allowed in the main net. PoA is supported by service chain
 	if chainConfig.Governance == nil {
-		chainConfig.Governance = governance.GetDefaultGovernanceConfig(params.UseIstanbul)
+		chainConfig.Governance = params.GetDefaultGovernanceConfig(params.UseIstanbul)
 	}
 	return istanbulBackend.New(config.Rewardbase, &config.Istanbul, ctx.NodeKey(), db, gov, nodetype)
 }

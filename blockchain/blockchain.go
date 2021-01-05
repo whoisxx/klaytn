@@ -33,14 +33,14 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v7"
-	"github.com/klaytn/klaytn/common/hexutil"
-
 	lru "github.com/hashicorp/golang-lru"
 	"github.com/klaytn/klaytn/blockchain/state"
 	"github.com/klaytn/klaytn/blockchain/types"
 	"github.com/klaytn/klaytn/blockchain/vm"
 	"github.com/klaytn/klaytn/common"
+	"github.com/klaytn/klaytn/common/hexutil"
 	"github.com/klaytn/klaytn/common/mclock"
+	"github.com/klaytn/klaytn/common/prque"
 	"github.com/klaytn/klaytn/consensus"
 	"github.com/klaytn/klaytn/crypto"
 	"github.com/klaytn/klaytn/event"
@@ -50,16 +50,34 @@ import (
 	"github.com/klaytn/klaytn/storage/database"
 	"github.com/klaytn/klaytn/storage/statedb"
 	"github.com/rcrowley/go-metrics"
-	"gopkg.in/karalabe/cookiejar.v2/collections/prque"
 )
 
+// If total insertion time of a block exceeds insertTimeLimit,
+// that time will be logged by blockLongInsertTimeGauge.
+const insertTimeLimit = common.PrettyDuration(time.Second)
+
 var (
-	blockInsertTimeGauge = metrics.NewRegisteredGauge("chain/inserts", nil)
-	ErrNoGenesis         = errors.New("Genesis not found in chain")
-	ErrNotExistNode      = errors.New("the node does not exist in cached node")
-	ErrQuitBySignal      = errors.New("quit by signal")
-	ErrNotInWarmUp       = errors.New("not in warm up")
-	logger               = log.NewModuleLogger(log.Blockchain)
+	accountReadTimer   = metrics.NewRegisteredTimer("state/account/reads", nil)
+	accountHashTimer   = metrics.NewRegisteredTimer("state/account/hashes", nil)
+	accountUpdateTimer = metrics.NewRegisteredTimer("state/account/updates", nil)
+	accountCommitTimer = metrics.NewRegisteredTimer("state/account/commits", nil)
+
+	storageReadTimer   = metrics.NewRegisteredTimer("state/storage/reads", nil)
+	storageHashTimer   = metrics.NewRegisteredTimer("state/storage/hashes", nil)
+	storageUpdateTimer = metrics.NewRegisteredTimer("state/storage/updates", nil)
+	storageCommitTimer = metrics.NewRegisteredTimer("state/storage/commits", nil)
+
+	blockInsertTimer        = metrics.NewRegisteredTimer("chain/inserts", nil)
+	blockProcessTimer       = metrics.NewRegisteredTimer("chain/process", nil)
+	blockExecutionTimer     = metrics.NewRegisteredTimer("chain/execution", nil)
+	blockFinalizeTimer      = metrics.NewRegisteredTimer("chain/finalize", nil)
+	blockValidateTimer      = metrics.NewRegisteredTimer("chain/validate", nil)
+	ErrNoGenesis            = errors.New("genesis not found in chain")
+	ErrNotExistNode         = errors.New("the node does not exist in cached node")
+	ErrQuitBySignal         = errors.New("quit by signal")
+	ErrNotInWarmUp          = errors.New("not in warm up")
+	logger                  = log.NewModuleLogger(log.Blockchain)
+	kesCachePrefixBlockLogs = []byte("blockLogs")
 )
 
 // Below is the list of the constants for cache size.
@@ -85,8 +103,6 @@ const (
 // 2) trie caching/pruning resident in a blockchain.
 type CacheConfig struct {
 	// TODO-Klaytn-Issue1666 Need to check the benefit of trie caching.
-	StateDBCaching       bool                        // Enables caching of state objects in stateDB
-	TxPoolStateCache     bool                        // Enables caching of nonce and balance for txpool
 	ArchiveMode          bool                        // If true, state trie is not pruned and always written to database
 	CacheSize            int                         // Size of in-memory cache of a trie (MiB) to flush matured singleton trie nodes to disk
 	BlockInterval        uint                        // Block interval to flush the trie. Each interval state trie will be flushed into disk
@@ -160,12 +176,6 @@ type BlockChain struct {
 
 	parallelDBWrite bool // TODO-Klaytn-Storage parallelDBWrite will be replaced by number of goroutines when worker pool pattern is introduced.
 
-	cachedStateDB       *state.StateDB
-	lastUpdatedRootHash common.Hash
-
-	nonceCache   common.Cache
-	balanceCache common.Cache
-
 	// State migration
 	prepareStateMigration bool
 	stopStateMigration    chan struct{}
@@ -186,7 +196,6 @@ type BlockChain struct {
 func NewBlockChain(db database.DBManager, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config) (*BlockChain, error) {
 	if cacheConfig == nil {
 		cacheConfig = &CacheConfig{
-			StateDBCaching:      false,
 			ArchiveMode:         false,
 			CacheSize:           512,
 			BlockInterval:       DefaultBlockInterval,
@@ -195,18 +204,13 @@ func NewBlockChain(db database.DBManager, cacheConfig *CacheConfig, chainConfig 
 		}
 	}
 
+	state.EnabledExpensive = db.GetDBConfig().EnableDBPerfMetrics
+
 	// Initialize DeriveSha implementation
 	InitDeriveSha(chainConfig.DeriveShaImpl)
 
 	futureBlocks, _ := lru.New(maxFutureBlocks)
 	badBlocks, _ := lru.New(maxBadBlocks)
-
-	var nonceCache common.Cache
-	var balanceCache common.Cache
-	if cacheConfig.TxPoolStateCache {
-		nonceCache = common.NewCache(common.FIFOCacheConfig{CacheSize: maxAccountForCache})
-		balanceCache = common.NewCache(common.FIFOCacheConfig{CacheSize: maxAccountForCache})
-	}
 
 	bc := &BlockChain{
 		chainConfig:        chainConfig,
@@ -222,8 +226,6 @@ func NewBlockChain(db database.DBManager, cacheConfig *CacheConfig, chainConfig 
 		vmConfig:           vmConfig,
 		badBlocks:          badBlocks,
 		parallelDBWrite:    db.IsParallelDBWrite(),
-		nonceCache:         nonceCache,
-		balanceCache:       balanceCache,
 		stopStateMigration: make(chan struct{}),
 	}
 
@@ -265,6 +267,27 @@ func NewBlockChain(db database.DBManager, cacheConfig *CacheConfig, chainConfig 
 	go bc.restartStateMigration()
 
 	return bc, nil
+}
+
+// SetCanonicalBlock resets the canonical as the block with the given block number.
+// It works as rewinding the head block to the previous one, but does not delete the data.
+func (bc *BlockChain) SetCanonicalBlock(blockNum uint64) {
+	// If the given block number is zero (it is zero by default), it does nothing
+	if blockNum == 0 {
+		return
+	}
+	// Read the block with the given block number and set it as canonical block
+	targetBlock := bc.db.ReadBlockByNumber(blockNum)
+	if targetBlock == nil {
+		logger.Error("failed to retrieve the block", "blockNum", blockNum)
+		return
+	}
+	bc.insert(targetBlock)
+	if err := bc.loadLastState(); err != nil {
+		logger.Error("failed to load last state after setting the canonical block", "err", err)
+		return
+	}
+	logger.Info("successfully set the canonical block", "blockNum", blockNum)
 }
 
 func (bc *BlockChain) UseGiniCoeff() bool {
@@ -514,49 +537,6 @@ func (bc *BlockChain) StateCache() state.Database {
 	return bc.stateCache
 }
 
-// StateAtWithCache returns a new mutable state based on a particular point in time.
-// If different from StateAt() in that it uses state object caching.
-func (bc *BlockChain) StateAtWithCache(root common.Hash) (*state.StateDB, error) {
-	if bc.cachedStateDB == nil {
-		return state.NewWithCache(root, bc.stateCache, state.NewCachedStateObjects())
-	} else {
-		return state.NewWithCache(root, bc.stateCache, bc.cachedStateDB.GetCachedStateObjects())
-	}
-}
-
-// TryGetCachedStateDB tries to get cachedStateDB, if StateDBCaching flag is true and it exists.
-// It checks the validity of cachedStateDB by comparing saved lastUpdatedRootHash and passed headRootHash.
-func (bc *BlockChain) TryGetCachedStateDB(rootHash common.Hash) (*state.StateDB, error) {
-	if !bc.cacheConfig.StateDBCaching {
-		return bc.StateAt(rootHash)
-	}
-
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
-
-	// When cachedStateDB is nil, set cachedStateDB with a new StateDB.
-	if bc.cachedStateDB == nil {
-		if !common.EmptyHash(bc.lastUpdatedRootHash) {
-			logger.Error("cachedStateDB is nil, but lastUpdatedRootHash is not common.Hash{}!",
-				"lastUpdatedRootHash", bc.lastUpdatedRootHash.String())
-			bc.lastUpdatedRootHash = common.Hash{}
-		}
-		cacheGetStateDBMissMeter.Mark(1)
-		return bc.StateAtWithCache(rootHash)
-	}
-
-	// If cachedStateDB exists, check if we can use cachedStateDB.
-	// If given rootHash is different from lastUpdatedRootHash, return stateDB without cache.
-	if rootHash != bc.lastUpdatedRootHash {
-		logger.Trace("Given rootHash is different from lastUpdatedRootHash",
-			"givenRootHash", rootHash, "lastUpdatedRootHash", bc.lastUpdatedRootHash)
-		cacheGetStateDBMissMeter.Mark(1)
-		return bc.StateAt(rootHash)
-	}
-	cacheGetStateDBHitMeter.Mark(1)
-	return bc.StateAtWithCache(rootHash)
-}
-
 // Reset purges the entire blockchain, restoring it to its genesis state.
 func (bc *BlockChain) Reset() error {
 	return bc.ResetWithGenesisBlock(bc.genesisBlock)
@@ -629,14 +609,18 @@ func (bc *BlockChain) ExportN(w io.Writer, first uint64, last uint64) error {
 	}
 	logger.Info("Exporting batch of blocks", "count", last-first+1)
 
+	start, reported := time.Now(), time.Now()
 	for nr := first; nr <= last; nr++ {
 		block := bc.GetBlockByNumber(nr)
 		if block == nil {
 			return fmt.Errorf("export failed on #%d: not found", nr)
 		}
-
 		if err := block.EncodeRLP(w); err != nil {
 			return err
+		}
+		if time.Since(reported) >= log.StatsReportLimit {
+			logger.Info("Exporting blocks", "exported", block.NumberU64()-first, "elapsed", common.PrettyDuration(time.Since(start)))
+			reported = time.Now()
 		}
 	}
 
@@ -895,6 +879,13 @@ const (
 	CanonStatTy
 	SideStatTy
 )
+
+// WriteResult includes the block write status and related statistics.
+type WriteResult struct {
+	Status         WriteStatus
+	TotalWriteTime time.Duration
+	TrieWriteTime  time.Duration
+}
 
 // Rollback is designed to remove a chain of links from the database that aren't
 // certain enough to be valid.
@@ -1156,7 +1147,7 @@ func (bc *BlockChain) gcCachedNodeLoop() {
 		for {
 			select {
 			case block := <-bc.chBlock:
-				bc.triegc.Push(block.root, -float32(block.blockNum))
+				bc.triegc.Push(block.root, -int64(block.blockNum))
 				logger.Trace("Push GC block", "blkNum", block.blockNum, "hash", block.root.String())
 
 				blkNum := block.blockNum
@@ -1214,8 +1205,8 @@ func isReorganizationRequired(localTd, externTd *big.Int, currentBlock, block *t
 // WriteBlockWithState writes the block and all associated state to the database.
 // If BlockChain.parallelDBWrite is true, it calls writeBlockWithStateParallel.
 // If not, it calls writeBlockWithStateSerial.
-func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, stateDB *state.StateDB) (WriteStatus, error) {
-	var status WriteStatus
+func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, stateDB *state.StateDB) (WriteResult, error) {
+	var status WriteResult
 	var err error
 	if bc.parallelDBWrite {
 		status, err = bc.writeBlockWithStateParallel(block, receipts, stateDB)
@@ -1223,31 +1214,16 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 		status, err = bc.writeBlockWithStateSerial(block, receipts, stateDB)
 	}
 
-	// TODO-Klaytn-Issue1911 After reviewing the behavior and performance, change the UpdateCacheStateObjects to update at the same time.
 	if err != nil {
 		return status, err
-	}
-
-	if bc.cacheConfig.TxPoolStateCache {
-		stateDB.UpdateTxPoolStateCache(bc.nonceCache, bc.balanceCache)
-	}
-
-	// Update lastUpdatedRootHash and cachedStateDB after successful WriteBlockWithState.
-	if stateDB.UseCachedStateObjects() {
-		bc.mu.Lock()
-		defer bc.mu.Unlock()
-
-		logger.Trace("Update cached StateDB information", "prevRootHash", bc.lastUpdatedRootHash.String(),
-			"newRootHash", block.Root().String(), "newBlockNum", block.NumberU64())
-
-		bc.lastUpdatedRootHash = block.Root()
-		stateDB.UpdateCachedStateObjects(block.Root())
-		bc.cachedStateDB = stateDB
 	}
 
 	// Publish the committed block to the redis cache of stateDB.
 	// The cache uses the block to distinguish the latest state.
 	if bc.cacheConfig.TrieNodeCacheConfig.RedisPublishBlockEnable {
+		blockLogsKey := append(kesCachePrefixBlockLogs, block.Number().Bytes()...)
+		bc.writeBlockLogsToRemoteCache(blockLogsKey, receipts)
+
 		blockRlp, err := rlp.EncodeToBytes(block)
 		if err != nil {
 			logger.Error("failed to encode lastCommittedBlock", "blockNumber", block.NumberU64(), "err", err)
@@ -1266,8 +1242,28 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	return status, err
 }
 
+// writeBlockLogsToRemoteCache writes block logs to remote cache.
+// The stored logs will be used by KES service nodes to subscribe log events.
+// This method is only for KES nodes.
+func (bc *BlockChain) writeBlockLogsToRemoteCache(blockLogsKey []byte, receipts []*types.Receipt) {
+	var entireBlockLogs []*types.LogForStorage
+	for _, receipt := range receipts {
+		for _, log := range receipt.Logs {
+			// convert Log to LogForStorage to encode entire data
+			entireBlockLogs = append(entireBlockLogs, (*types.LogForStorage)(log))
+		}
+	}
+	encodedBlockLogs, err := rlp.EncodeToBytes(entireBlockLogs)
+	if err != nil {
+		logger.Error("rlp encoding error", "err", err)
+		return
+	}
+	// TODO-Klaytn-KES: refine this not to use trieNodeCache
+	bc.stateCache.TrieDB().TrieNodeCache().Set(blockLogsKey, encodedBlockLogs)
+}
+
 // writeBlockWithStateSerial writes the block and all associated state to the database in serial manner.
-func (bc *BlockChain) writeBlockWithStateSerial(block *types.Block, receipts []*types.Receipt, state *state.StateDB) (WriteStatus, error) {
+func (bc *BlockChain) writeBlockWithStateSerial(block *types.Block, receipts []*types.Receipt, state *state.StateDB) (WriteResult, error) {
 	start := time.Now()
 	bc.wg.Add(1)
 	defer bc.wg.Done()
@@ -1278,14 +1274,14 @@ func (bc *BlockChain) writeBlockWithStateSerial(block *types.Block, receipts []*
 	if ptd == nil {
 		logger.Error("unknown ancestor (writeBlockWithStateSerial)", "num", block.NumberU64(),
 			"hash", block.Hash(), "parentHash", block.ParentHash())
-		return NonStatTy, consensus.ErrUnknownAncestor
+		return WriteResult{Status: NonStatTy}, consensus.ErrUnknownAncestor
 	}
 	// Make sure no inconsistent state is leaked during insertion
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
 	if !bc.ShouldTryInserting(block) {
-		return NonStatTy, ErrKnownBlock
+		return WriteResult{Status: NonStatTy}, ErrKnownBlock
 	}
 
 	currentBlock := bc.CurrentBlock()
@@ -1298,9 +1294,11 @@ func (bc *BlockChain) writeBlockWithStateSerial(block *types.Block, receipts []*
 	// Write other block data.
 	bc.writeBlock(block)
 
+	trieWriteStart := time.Now()
 	if err := bc.writeStateTrie(block, state); err != nil {
-		return NonStatTy, err
+		return WriteResult{Status: NonStatTy}, err
 	}
+	trieWriteTime := time.Since(trieWriteStart)
 
 	bc.writeReceipts(block.Hash(), block.NumberU64(), receipts)
 
@@ -1316,12 +1314,12 @@ func (bc *BlockChain) writeBlockWithStateSerial(block *types.Block, receipts []*
 		// Reorganise the chain if the parent is not the head block
 		if block.ParentHash() != currentBlock.Hash() {
 			if err := bc.reorg(currentBlock, block); err != nil {
-				return NonStatTy, err
+				return WriteResult{Status: NonStatTy}, err
 			}
 		}
 		// Write the positional metadata for transaction/receipt lookups and preimages
 		if err := bc.writeTxLookupEntries(block); err != nil {
-			return NonStatTy, err
+			return WriteResult{Status: NonStatTy}, err
 		}
 		bc.db.WritePreimages(block.NumberU64(), state.Preimages())
 		status = CanonStatTy
@@ -1329,11 +1327,11 @@ func (bc *BlockChain) writeBlockWithStateSerial(block *types.Block, receipts []*
 		status = SideStatTy
 	}
 
-	return bc.finalizeWriteBlockWithState(block, status, start)
+	return bc.finalizeWriteBlockWithState(block, status, start, trieWriteTime)
 }
 
 // writeBlockWithStateParallel writes the block and all associated state to the database using goroutines.
-func (bc *BlockChain) writeBlockWithStateParallel(block *types.Block, receipts []*types.Receipt, state *state.StateDB) (WriteStatus, error) {
+func (bc *BlockChain) writeBlockWithStateParallel(block *types.Block, receipts []*types.Receipt, state *state.StateDB) (WriteResult, error) {
 	start := time.Now()
 	bc.wg.Add(1)
 	defer bc.wg.Done()
@@ -1344,14 +1342,14 @@ func (bc *BlockChain) writeBlockWithStateParallel(block *types.Block, receipts [
 	if ptd == nil {
 		logger.Error("unknown ancestor (writeBlockWithStateParallel)", "num", block.NumberU64(),
 			"hash", block.Hash(), "parentHash", block.ParentHash())
-		return NonStatTy, consensus.ErrUnknownAncestor
+		return WriteResult{Status: NonStatTy}, consensus.ErrUnknownAncestor
 	}
 	// Make sure no inconsistent state is leaked during insertion
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
 	if !bc.ShouldTryInserting(block) {
-		return NonStatTy, ErrKnownBlock
+		return WriteResult{Status: NonStatTy}, ErrKnownBlock
 	}
 
 	currentBlock := bc.CurrentBlock()
@@ -1374,11 +1372,14 @@ func (bc *BlockChain) writeBlockWithStateParallel(block *types.Block, receipts [
 		bc.writeBlock(block)
 	}()
 
+	var trieWriteTime time.Duration
+	trieWriteStart := time.Now()
 	go func() {
 		defer parallelDBWriteWG.Done()
 		if err := bc.writeStateTrie(block, state); err != nil {
 			parallelDBWriteErrCh <- err
 		}
+		trieWriteTime = time.Since(trieWriteStart)
 	}()
 
 	go func() {
@@ -1390,7 +1391,7 @@ func (bc *BlockChain) writeBlockWithStateParallel(block *types.Block, receipts [
 	parallelDBWriteWG.Wait()
 	select {
 	case err := <-parallelDBWriteErrCh:
-		return NonStatTy, err
+		return WriteResult{Status: NonStatTy}, err
 	default:
 	}
 
@@ -1406,7 +1407,7 @@ func (bc *BlockChain) writeBlockWithStateParallel(block *types.Block, receipts [
 		// Reorganise the chain if the parent is not the head block
 		if block.ParentHash() != currentBlock.Hash() {
 			if err := bc.reorg(currentBlock, block); err != nil {
-				return NonStatTy, err
+				return WriteResult{Status: NonStatTy}, err
 			}
 		}
 
@@ -1435,15 +1436,15 @@ func (bc *BlockChain) writeBlockWithStateParallel(block *types.Block, receipts [
 
 	select {
 	case err := <-parallelDBWriteErrCh:
-		return NonStatTy, err
+		return WriteResult{Status: NonStatTy}, err
 	default:
 	}
 
-	return bc.finalizeWriteBlockWithState(block, status, start)
+	return bc.finalizeWriteBlockWithState(block, status, start, trieWriteTime)
 }
 
 // finalizeWriteBlockWithState updates metrics and inserts block when status is CanonStatTy.
-func (bc *BlockChain) finalizeWriteBlockWithState(block *types.Block, status WriteStatus, startTime time.Time) (WriteStatus, error) {
+func (bc *BlockChain) finalizeWriteBlockWithState(block *types.Block, status WriteStatus, startTime time.Time, trieWriteTime time.Duration) (WriteResult, error) {
 	// Set new head.
 	if status == CanonStatTy {
 		bc.insert(block)
@@ -1452,11 +1453,7 @@ func (bc *BlockChain) finalizeWriteBlockWithState(block *types.Block, status Wri
 		blockTxCountsCounter.Inc(int64(block.Transactions().Len()))
 	}
 	bc.futureBlocks.Remove(block.Hash())
-
-	elapsed := time.Since(startTime)
-	logger.Debug("WriteBlockWithState", "blockNum", block.Number(), "parentHash", block.Header().ParentHash, "txs", len(block.Transactions()), "elapsed", elapsed)
-
-	return status, nil
+	return WriteResult{status, time.Since(startTime), trieWriteTime}, nil
 }
 
 func (bc *BlockChain) writeTxLookupEntries(block *types.Block) error {
@@ -1618,6 +1615,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 			}
 
 		case err != nil:
+			bc.futureBlocks.Remove(block.Hash())
 			bc.reportBlock(block, nil, err)
 			return i, events, coalescedLogs, err
 		}
@@ -1630,37 +1628,28 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 			parent = chain[i-1]
 		}
 
-		stateDB, err := bc.TryGetCachedStateDB(parent.Root())
+		stateDB, err := bc.StateAt(parent.Root())
 		if err != nil {
 			return i, events, coalescedLogs, err
 		}
 
-		// for debug
-		start := time.Now()
-
 		// Process block using the parent state as reference point.
-		receipts, logs, usedGas, internalTxTraces, err := bc.processor.Process(block, stateDB, bc.vmConfig)
+		receipts, logs, usedGas, internalTxTraces, procStats, err := bc.processor.Process(block, stateDB, bc.vmConfig)
 		if err != nil {
 			bc.reportBlock(block, receipts, err)
 			return i, events, coalescedLogs, err
-		}
-
-		if block.Transactions().Len() > 0 {
-
-			elapsed := time.Since(start)
-			logger.Debug("blockchain.blockchain processing block", "elapsed", elapsed, "txs", block.Transactions().Len())
 		}
 
 		// Validate the state using the default validator
 		err = bc.Validator().ValidateState(block, parent, stateDB, receipts, usedGas)
 		if err != nil {
-
 			bc.reportBlock(block, receipts, err)
 			return i, events, coalescedLogs, err
 		}
+		afterValidate := time.Now()
 
-		// Write the block to the chain and get the status.
-		status, err := bc.WriteBlockWithState(block, receipts, stateDB)
+		// Write the block to the chain and get the writeResult.
+		writeResult, err := bc.WriteBlockWithState(block, receipts, stateDB)
 		if err != nil {
 			if err == ErrKnownBlock {
 				logger.Debug("Tried to insert already known block", "num", block.NumberU64(), "hash", block.Hash().String())
@@ -1669,10 +1658,36 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 			return i, events, coalescedLogs, err
 		}
 
-		switch status {
+		// Update the metrics subsystem with all the measurements
+		accountReadTimer.Update(stateDB.AccountReads)
+		accountHashTimer.Update(stateDB.AccountHashes)
+		accountUpdateTimer.Update(stateDB.AccountUpdates)
+		accountCommitTimer.Update(stateDB.AccountCommits)
+
+		storageReadTimer.Update(stateDB.StorageReads)
+		storageHashTimer.Update(stateDB.StorageHashes)
+		storageUpdateTimer.Update(stateDB.StorageUpdates)
+		storageCommitTimer.Update(stateDB.StorageCommits)
+
+		trieAccess := stateDB.AccountReads + stateDB.AccountHashes + stateDB.AccountUpdates + stateDB.AccountCommits
+		trieAccess += stateDB.StorageReads + stateDB.StorageHashes + stateDB.StorageUpdates + stateDB.StorageCommits
+
+		switch writeResult.Status {
 		case CanonStatTy:
-			logger.Debug("Inserted new block", "number", block.Number(), "hash", block.Hash(),
-				"txs", len(block.Transactions()), "gas", block.GasUsed(), "elapsed", common.PrettyDuration(time.Since(bstart)))
+			processTxsTime := common.PrettyDuration(procStats.AfterApplyTxs.Sub(procStats.BeforeApplyTxs))
+			processFinalizeTime := common.PrettyDuration(procStats.AfterFinalize.Sub(procStats.AfterApplyTxs))
+			validateTime := common.PrettyDuration(afterValidate.Sub(procStats.AfterFinalize))
+			totalTime := common.PrettyDuration(time.Since(bstart))
+			logger.Info("Inserted a new block", "number", block.Number(), "hash", block.Hash(),
+				"txs", len(block.Transactions()), "gas", block.GasUsed(), "elapsed", totalTime,
+				"processTxs", processTxsTime, "finalize", processFinalizeTime, "validateState", validateTime,
+				"totalWrite", writeResult.TotalWriteTime, "trieWrite", writeResult.TrieWriteTime)
+
+			blockProcessTimer.Update(time.Duration(processTxsTime))
+			blockExecutionTimer.Update(time.Duration(processTxsTime) - trieAccess)
+			blockFinalizeTimer.Update(time.Duration(processFinalizeTime))
+			blockValidateTimer.Update(time.Duration(validateTime))
+			blockInsertTimer.Update(time.Duration(totalTime))
 
 			coalescedLogs = append(coalescedLogs, logs...)
 			events = append(events, ChainEvent{
@@ -1690,7 +1705,6 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 
 			events = append(events, ChainSideEvent{block})
 		}
-		blockInsertTimeGauge.Update(int64(time.Since(bstart)))
 		stats.processed++
 		stats.usedGas += usedGas
 
@@ -1736,19 +1750,73 @@ func (bc *BlockChain) BlockSubscriptionLoop(pool *TxPool) {
 			continue
 		}
 
-		// TODO-Klaytn-KES: implement block handling logic
-		// if bc.cacheConfig.TrieNodeCacheConfig.ProcessBlock {
-		// 	_, err := bc.InsertChain(types.Blocks{block})
-		// 	if err != nil {
-		// 		logger.Crit("failed to insert a block", "err", err)
-		// 	}
-		// } else {
-		// 	oldHead := bc.CurrentHeader()
-		// 	bc.replaceCurrentBlock(block)
-		// 	pool.lockedReset(oldHead, bc.CurrentHeader())
-		// }
+		oldHead := bc.CurrentHeader()
+		bc.replaceCurrentBlock(block)
+		pool.lockedReset(oldHead, bc.CurrentHeader())
+
+		// just in case the block number jumps up more than one, iterates all missed blocks
+		for blockNum := oldHead.Number.Uint64() + 1; blockNum < block.Number().Uint64(); blockNum++ {
+			retrievedBlock := bc.GetBlockByNumber(blockNum)
+			bc.sendKESSubscriptionData(retrievedBlock)
+		}
+		bc.sendKESSubscriptionData(block)
 	}
-	logger.Info("close the block subscription loop")
+
+	logger.Info("closed the block subscription loop")
+}
+
+// sendKESSubscriptionData sends data to chainFeed and logsFeed.
+// ChainEvent containing only Block and Hash is sent to chainFeed.
+// []*types.Log containing entire logs of a block is set to logsFeed.
+// The logs are expected to be delivered from remote cache.
+// If it failed to read log data from remote cache, it will read the data from database.
+// This method is only for KES nodes.
+func (bc *BlockChain) sendKESSubscriptionData(block *types.Block) {
+	bc.chainFeed.Send(ChainEvent{
+		Block: block,
+		Hash:  block.Hash(),
+		// TODO-Klaytn-KES: fill the following data if needed
+		Receipts:         types.Receipts{},
+		Logs:             []*types.Log{},
+		InternalTxTraces: []*vm.InternalTxTrace{},
+	})
+
+	// TODO-Klaytn-KES: refine this not to use trieNodeCache
+	logKey := append(kesCachePrefixBlockLogs, block.Number().Bytes()...)
+	encodedLogs := bc.stateCache.TrieDB().TrieNodeCache().Get(logKey)
+	if encodedLogs == nil {
+		logger.Warn("cannot get a block log from the remote cache", "blockNum", block.NumberU64())
+
+		// read log data from database and send it
+		logsList := bc.GetLogsByHash(block.Header().Hash())
+		var logs []*types.Log
+		for _, list := range logsList {
+			logs = append(logs, list...)
+		}
+		bc.logsFeed.Send(logs)
+		return
+	}
+
+	entireLogs := []*types.LogForStorage{}
+	if err := rlp.DecodeBytes(encodedLogs, &entireLogs); err != nil {
+		logger.Warn("failed to decode a block log", "blockNum", block.NumberU64(), "err", err)
+
+		// read log data from database and send it
+		logsList := bc.GetLogsByHash(block.Header().Hash())
+		var logs []*types.Log
+		for _, list := range logsList {
+			logs = append(logs, list...)
+		}
+		bc.logsFeed.Send(logs)
+		return
+	}
+
+	// convert LogForStorage to Log
+	logs := make([]*types.Log, len(entireLogs))
+	for i, log := range entireLogs {
+		logs[i] = (*types.Log)(log)
+	}
+	bc.logsFeed.Send(logs)
 }
 
 // CloseBlockSubscriptionLoop closes BlockSubscriptionLoop.
@@ -1763,38 +1831,35 @@ func (bc *BlockChain) CloseBlockSubscriptionLoop() {
 }
 
 // replaceCurrentBlock replaces bc.currentBlock to the given block.
-// func (bc *BlockChain) replaceCurrentBlock(latestBlock *types.Block) {
-// 	bc.mu.Lock()
-// 	defer bc.mu.Unlock()
-//
-// 	if latestBlock == nil {
-// 		logger.Error("no latest block")
-// 		return
-// 	}
-//
-// 	// Return early if it is the first block update.
-// 	currentBlock := bc.CurrentBlock()
-// 	if currentBlock == nil {
-// 		bc.insert(latestBlock)
-// 		logger.Info("inserted an initial block", "blockNumber", latestBlock.NumberU64(),
-// 			"hash", latestBlock.Hash().String(), "stateRoot", latestBlock.Root().String())
-// 		return
-// 	}
-//
-// 	// Don't update current block if the latest block is not newer than current block.
-// 	if currentBlock.NumberU64() >= latestBlock.NumberU64() {
-// 		logger.Debug("")
-// 		return
-// 	}
-//
-// 	// Insert a new block and update metrics
-// 	bc.insert(latestBlock)
-// 	headBlockNumberGauge.Update(latestBlock.Number().Int64())
-// 	bc.stateCache.TrieDB().UpdateMetricNodes()
-//
-// 	logger.Info("inserted a new block", "prevBlockNumber", currentBlock.NumberU64(), "blockNumber",
-// 		latestBlock.NumberU64(), "hash", latestBlock.Hash().String(), "stateRoot", latestBlock.Root().String())
-// }
+func (bc *BlockChain) replaceCurrentBlock(latestBlock *types.Block) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	if latestBlock == nil {
+		logger.Error("no latest block")
+		return
+	}
+
+	// Don't update current block if the latest block is not newer than current block.
+	currentBlock := bc.CurrentBlock()
+	if currentBlock.NumberU64() >= latestBlock.NumberU64() {
+		logger.Debug("ignore an old block", "currentBlockNumber", currentBlock.NumberU64(), "oldBlockNumber",
+			latestBlock.NumberU64())
+		return
+	}
+
+	// Insert a new block and update metrics
+	bc.insert(latestBlock)
+	bc.hc.SetCurrentHeader(latestBlock.Header())
+
+	headBlockNumberGauge.Update(latestBlock.Number().Int64())
+	blockTxCountsGauge.Update(int64(latestBlock.Transactions().Len()))
+	blockTxCountsCounter.Inc(int64(latestBlock.Transactions().Len()))
+	bc.stateCache.TrieDB().UpdateMetricNodes()
+
+	logger.Info("Replaced the current block",
+		"blkNum", latestBlock.NumberU64(), "blkHash", latestBlock.Hash().String())
+}
 
 // insertStats tracks and reports on block insertion.
 type insertStats struct {
@@ -1807,6 +1872,10 @@ type insertStats struct {
 // report prints statistics if some number of blocks have been processed
 // or more than a few seconds have passed since the last message.
 func (st *insertStats) report(chain []*types.Block, index int, cache common.StorageSize) {
+	// report will leave a log only if inserting two or more blocks at once
+	if len(chain) <= 1 {
+		return
+	}
 	// Fetch the timings for the batch
 	var (
 		now     = mclock.Now()
@@ -2197,33 +2266,8 @@ func (bc *BlockChain) IsSenderTxHashIndexingEnabled() bool {
 	return bc.cacheConfig.SenderTxHashIndexing
 }
 
-// GetNonceCache returns a nonceCache.
-func (bc *BlockChain) GetNonceCache() common.Cache {
-	return bc.nonceCache
-}
-
-// GetBalanceCache returns a balanceCache.
-func (bc *BlockChain) GetBalanceCache() common.Cache {
-	return bc.balanceCache
-}
-
-// GetNonceInCache returns (cachedNonce, true) if nonce exists in cache.
-// If not, it returns (0, false).
-func (bc *BlockChain) GetNonceInCache(addr common.Address) (uint64, bool) {
-	nonceCache := bc.GetNonceCache()
-
-	if nonceCache != nil {
-		if obj, exist := nonceCache.Get(addr); exist && obj != nil {
-			nonce, _ := obj.(uint64)
-			return nonce, true
-		}
-	}
-	return 0, false
-}
-
 func (bc *BlockChain) SaveTrieNodeCacheToDisk() error {
-	filePath := bc.db.GetDBConfig().Dir + "/fastcache"
-	return bc.stateCache.TrieDB().SaveTrieNodeCacheToFile(filePath)
+	return bc.stateCache.TrieDB().SaveTrieNodeCacheToFile(bc.cacheConfig.TrieNodeCacheConfig.FastCacheFileDir)
 }
 
 // ApplyTransaction attempts to apply a transaction to the given state database

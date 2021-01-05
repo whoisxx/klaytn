@@ -48,9 +48,7 @@ var FlagGroups = []FlagGroup{
 			ExtraDataFlag,
 			ConfigFileFlag,
 			OverwriteGenesisFlag,
-			WorkerDisableFlag,
-			DownloaderDisableFlag,
-			FetcherDisableFlag,
+			StartBlockNumberFlag,
 		},
 	},
 	{
@@ -95,6 +93,7 @@ var FlagGroups = []FlagGroup{
 			DynamoDBWriteCapacityFlag,
 			NoParallelDBWriteFlag,
 			SenderTxHashIndexingFlag,
+			DBNoPerformanceMetricsFlag,
 		},
 	},
 	{
@@ -165,7 +164,6 @@ var FlagGroups = []FlagGroup{
 	{
 		Name: "STATE",
 		Flags: []cli.Flag{
-			StateDBCachingFlag,
 			TrieMemoryCacheSizeFlag,
 			TrieBlockIntervalFlag,
 			TriesInMemoryFlag,
@@ -178,7 +176,6 @@ var FlagGroups = []FlagGroup{
 			CacheScaleFlag,
 			CacheUsageLevelFlag,
 			MemorySizeFlag,
-			TxPoolStateCacheFlag,
 			TrieNodeCacheTypeFlag,
 			TrieNodeCacheLimitFlag,
 			TrieNodeCacheRedisEndpointsFlag,
@@ -241,6 +238,7 @@ var FlagGroups = []FlagGroup{
 			RPCCORSDomainFlag,
 			RPCVirtualHostsFlag,
 			RPCApiFlag,
+			RPCGlobalGasCap,
 			IPCDisabledFlag,
 			IPCPathFlag,
 			WSEnabledFlag,
@@ -293,6 +291,7 @@ var FlagGroups = []FlagGroup{
 			AutoRestartFlag,
 			RestartTimeOutFlag,
 			DaemonPathFlag,
+			KESNodeTypeServiceFlag,
 		},
 	},
 }

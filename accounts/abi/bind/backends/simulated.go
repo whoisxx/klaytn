@@ -24,6 +24,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
+	"sync"
+	"time"
+
 	"github.com/klaytn/klaytn"
 	"github.com/klaytn/klaytn/accounts/abi/bind"
 	"github.com/klaytn/klaytn/blockchain"
@@ -39,9 +43,6 @@ import (
 	"github.com/klaytn/klaytn/node/cn/filters"
 	"github.com/klaytn/klaytn/params"
 	"github.com/klaytn/klaytn/storage/database"
-	"math/big"
-	"sync"
-	"time"
 )
 
 // This nil assignment ensures compile time that SimulatedBackend implements bind.ContractBackend.
@@ -106,6 +107,12 @@ func (b *SimulatedBackend) BlockChain() *blockchain.BlockChain {
 
 func (b *SimulatedBackend) PendingBlock() *types.Block {
 	return b.pendingBlock
+}
+
+// Close terminates the underlying blockchain's update loop.
+func (b *SimulatedBackend) Close() error {
+	b.blockchain.Stop()
+	return nil
 }
 
 // Commit imports all the pending transactions as a single block and starts a
@@ -191,6 +198,23 @@ func (b *SimulatedBackend) TransactionReceipt(ctx context.Context, txHash common
 	return receipt, nil
 }
 
+// TransactionByHash checks the pool of pending transactions in addition to the
+// blockchain. The isPending return value indicates whether the transaction has been
+// mined yet. Note that the transaction may not be part of the canonical chain even if
+// it's not pending.
+func (b *SimulatedBackend) TransactionByHash(ctx context.Context, txHash common.Hash) (tx *types.Transaction, isPending bool, err error) {
+	tx = b.pendingBlock.Transaction(txHash)
+	if tx != nil {
+		return tx, true, nil
+	}
+	tx, _, _, _ = b.database.ReadTxAndLookupInfo(txHash)
+	if tx != nil {
+		return tx, false, nil
+	}
+
+	return nil, false, klaytn.NotFound
+}
+
 // PendingCodeAt returns the code associated with an account in the pending state.
 func (b *SimulatedBackend) PendingCodeAt(ctx context.Context, contract common.Address) ([]byte, error) {
 	b.mu.Lock()
@@ -207,11 +231,11 @@ func (b *SimulatedBackend) CallContract(ctx context.Context, call klaytn.CallMsg
 	if blockNumber != nil && blockNumber.Cmp(b.blockchain.CurrentBlock().Number()) != 0 {
 		return nil, errBlockNumberUnsupported
 	}
-	state, err := b.blockchain.State()
+	currentState, err := b.blockchain.State()
 	if err != nil {
 		return nil, err
 	}
-	rval, _, _, err := b.callContract(ctx, call, b.blockchain.CurrentBlock(), state)
+	rval, _, _, err := b.callContract(ctx, call, b.blockchain.CurrentBlock(), currentState)
 	return rval, err
 }
 
@@ -240,8 +264,7 @@ func (b *SimulatedBackend) SuggestGasPrice(ctx context.Context) (*big.Int, error
 	return new(big.Int).SetUint64(b.config.UnitPrice), nil
 }
 
-// EstimateGas executes the requested code against the currently pending block/state and
-// returns the used amount of gas.
+// EstimateGas executes the requested code against the latest block/state and returns the used amount of gas.
 func (b *SimulatedBackend) EstimateGas(ctx context.Context, call klaytn.CallMsg) (uint64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -263,10 +286,11 @@ func (b *SimulatedBackend) EstimateGas(ctx context.Context, call klaytn.CallMsg)
 	executable := func(gas uint64) bool {
 		call.Gas = gas
 
-		snapshot := b.pendingState.Snapshot()
-		_, _, failed, err := b.callContract(ctx, call, b.pendingBlock, b.pendingState)
-		b.pendingState.RevertToSnapshot(snapshot)
-
+		currentState, err := b.blockchain.State()
+		if err != nil {
+			return false
+		}
+		_, _, failed, err := b.callContract(ctx, call, b.blockchain.CurrentBlock(), currentState)
 		if err != nil || failed {
 			return false
 		}

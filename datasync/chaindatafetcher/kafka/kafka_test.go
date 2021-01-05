@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"math/rand"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -94,13 +95,25 @@ func (s *KafkaSuite) TestKafka_makeProducerMessage() {
 	idx := rand.Uint64() % totalSegments
 
 	// make a producer message with the random input
-	msg := s.kfk.makeProducerMessage(s.topic, data, idx, totalSegments)
+	msg := s.kfk.makeProducerMessage(s.topic, "", data, idx, totalSegments)
 
 	// compare the data is correctly inserted
 	s.Equal(s.topic, msg.Topic)
 	s.Equal(sarama.ByteEncoder(data), msg.Value)
-	s.Equal(totalSegments, binary.BigEndian.Uint64(msg.Headers[MsgIdxTotalSegments].Value))
-	s.Equal(idx, binary.BigEndian.Uint64(msg.Headers[MsgIdxSegmentIdx].Value))
+	s.Equal(totalSegments, binary.BigEndian.Uint64(msg.Headers[MsgHeaderTotalSegments].Value))
+	s.Equal(idx, binary.BigEndian.Uint64(msg.Headers[MsgHeaderSegmentIdx].Value))
+}
+
+func (s *KafkaSuite) TestKafka_setupTopic() {
+	topicName := "test-setup-topic"
+
+	// create a new topic
+	err := s.kfk.setupTopic(topicName)
+	s.NoError(err)
+
+	// try to create duplicated topic
+	err = s.kfk.setupTopic(topicName)
+	s.NoError(err)
 }
 
 func (s *KafkaSuite) TestKafka_CreateAndDeleteTopic() {
@@ -165,10 +178,11 @@ func (s *KafkaSuite) subscribeData(topic, groupId string, numTests int, handler 
 	}()
 
 	// wait for all data to be consumed
-	timeout := time.NewTimer(3 * time.Second)
+	timeout := time.NewTimer(5 * time.Second)
 	for i := 0; i < numTests; i++ {
 		select {
 		case <-numCheckCh:
+			s.T().Logf("test count: %v, total tests: %v", i+1, numTests)
 		case <-timeout.C:
 			s.Fail("timeout")
 		}
@@ -297,13 +311,9 @@ func (s *KafkaSuite) TestKafka_PubSubWith2DifferentGroups() {
 }
 
 func (s *KafkaSuite) TestKafka_PubSubWithSegments() {
-	numTests := 1
+	numTests := 5
 	testBytesSize := 10
 	segmentSize := 3
-
-	// to calculate data length
-	data, _ := json.Marshal(&kafkaData{common.MakeRandomBytes(testBytesSize)})
-	totalSegments := len(data) / segmentSize
 
 	s.kfk.config.SegmentSizeBytes = segmentSize
 	topic := "test-message-segments"
@@ -312,27 +322,52 @@ func (s *KafkaSuite) TestKafka_PubSubWithSegments() {
 	// publish random data
 	expected := s.publishRandomData(topic, numTests, testBytesSize)
 
-	// gather the published data segments
-	var msgs []*sarama.ConsumerMessage
-	s.subscribeData(topic, "test-group-id", totalSegments, func(message *sarama.ConsumerMessage) error {
-		msgs = append(msgs, message)
+	var actual []*kafkaData
+	s.subscribeData(topic, "test-group-id", numTests, func(message *sarama.ConsumerMessage) error {
+		var d *kafkaData
+		json.Unmarshal(message.Value, &d)
+		actual = append(actual, d)
 		return nil
 	})
+	s.Equal(expected, actual)
+}
 
-	// check the data segments are correctly inserted with the order
-	s.Equal(totalSegments, len(msgs))
-	var actual []byte
-	for idx, msg := range msgs {
-		actual = append(actual, msg.Value...)
-		s.Equal(uint64(totalSegments), binary.BigEndian.Uint64(msg.Headers[MsgIdxTotalSegments].Value))
-		s.Equal(uint64(idx), binary.BigEndian.Uint64(msg.Headers[MsgIdxSegmentIdx].Value))
-		s.Equal(topic, msg.Topic)
+func (s *KafkaSuite) TestKafka_PubSubWithSegements_BufferOverflow() {
+	// create a topic
+	topic := "test-message-segments-buffer-overflow"
+	err := s.kfk.setupTopic(topic)
+	s.NoError(err)
+
+	// insert incomplete message segments
+	for i := 0; i < 3; i++ {
+		msg := s.kfk.makeProducerMessage(topic, "test-key-"+strconv.Itoa(i), common.MakeRandomBytes(10), 0, 2)
+		_, _, err = s.kfk.producer.SendMessage(msg)
+		s.NoError(err)
 	}
 
-	// check the result after resembling the segments
-	var d *kafkaData
-	json.Unmarshal(actual, &d)
-	s.Equal(expected, []*kafkaData{d})
+	// setup consumer to handle errors
+	s.kfk.config.MaxMessageNumber = 1 // if buffer size is greater than 1, then it returns an error
+	s.kfk.config.SaramaConfig.Consumer.Return.Errors = true
+	s.kfk.config.SaramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
+	consumer, err := NewConsumer(s.kfk.config, "test-group-id")
+	s.NoError(err)
+	consumer.topics = append(consumer.topics, topic)
+	consumer.handlers[topic] = func(message *sarama.ConsumerMessage) error { return nil }
+	errCh := consumer.Errors()
+
+	go func() {
+		err = consumer.Subscribe(context.Background())
+		s.NoError(err)
+	}()
+
+	// checkout the returned error is buffer overflow error
+	timeout := time.NewTimer(3 * time.Second)
+	select {
+	case <-timeout.C:
+		s.Fail("timeout")
+	case err := <-errCh:
+		s.True(strings.Contains(err.Error(), bufferOverflowErrorMsg))
+	}
 }
 
 func (s *KafkaSuite) TestKafka_Consumer_AddTopicAndHandler() {
@@ -342,10 +377,10 @@ func (s *KafkaSuite) TestKafka_Consumer_AddTopicAndHandler() {
 	blockGroupHandler := func(msg *sarama.ConsumerMessage) error { return nil }
 	s.NoError(consumer.AddTopicAndHandler(EventBlockGroup, blockGroupHandler))
 	traceGroupHandler := func(msg *sarama.ConsumerMessage) error { return nil }
-	s.NoError(consumer.AddTopicAndHandler(EventTraceBroup, traceGroupHandler))
+	s.NoError(consumer.AddTopicAndHandler(EventTraceGroup, traceGroupHandler))
 
-	blockGroupTopic := s.kfk.config.getTopicName(EventBlockGroup)
-	traceGroupTopic := s.kfk.config.getTopicName(EventTraceBroup)
+	blockGroupTopic := s.kfk.config.GetTopicName(EventBlockGroup)
+	traceGroupTopic := s.kfk.config.GetTopicName(EventTraceGroup)
 	expectedTopics := []string{blockGroupTopic, traceGroupTopic}
 	s.Equal(expectedTopics, consumer.topics)
 	s.Equal(reflect.ValueOf(blockGroupHandler).Pointer(), reflect.ValueOf(consumer.handlers[blockGroupTopic]).Pointer())

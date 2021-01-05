@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/fastcache"
+	"github.com/klaytn/klaytn/blockchain/types"
 
 	"github.com/alecthomas/units"
 	lru "github.com/hashicorp/golang-lru"
@@ -117,7 +118,7 @@ func (bc *BlockChain) migrateState(rootHash common.Hash) (returnErr error) {
 	srcState := bc.StateCache()
 	dstState := state.NewDatabase(&stateTrieMigrationDB{bc.db})
 
-	// NOTE: lruCache is mendatory when state migration and block processing are executed simultaneously
+	// NOTE: lruCache is mandatory when state migration and block processing are executed simultaneously
 	lruCache, _ := lru.New(int(2 * units.Giga / common.HashLength)) // 2GB for 62,500,000 common.Hash key values
 	trieSync := state.NewStateSync(rootHash, dstState.TrieDB().DiskDB(), nil, lruCache)
 	var queue []common.Hash
@@ -382,9 +383,9 @@ func (bc *BlockChain) StateMigrationStatus() (bool, uint64, int, int, int, float
 	return bc.db.InMigration(), bc.db.MigrationBlockNumber(), bc.readCnt, bc.committedCnt, bc.pendingCnt, bc.progress, bc.migrationErr
 }
 
-func (bc *BlockChain) concurrentIterateTrie(root common.Hash, db state.Database, resultCh chan common.Hash, finishCh chan error) (resultErr error) {
+func (bc *BlockChain) concurrentIterateTrie(root common.Hash, db state.Database, resultCh chan struct{}, errCh chan error) (resultErr error) {
 	defer func() {
-		finishCh <- resultErr
+		errCh <- resultErr
 	}()
 
 	stateDB, err := state.New(root, db)
@@ -394,7 +395,7 @@ func (bc *BlockChain) concurrentIterateTrie(root common.Hash, db state.Database,
 
 	it := state.NewNodeIterator(stateDB)
 	for it.Next() {
-		resultCh <- it.Hash
+		resultCh <- struct{}{}
 
 		select {
 		case <-bc.quitWarmUp:
@@ -409,7 +410,7 @@ func (bc *BlockChain) concurrentIterateTrie(root common.Hash, db state.Database,
 }
 
 func (bc *BlockChain) warmUpLoop(cache statedb.TrieNodeCache, mainTrieCacheLimit uint64, children []common.Hash,
-	resultHashCh chan common.Hash, resultErrCh chan error) {
+	resultCh chan struct{}, errCh chan error) {
 	logged := time.Now()
 	var context []interface{}
 	var percent uint64
@@ -437,7 +438,7 @@ func (bc *BlockChain) warmUpLoop(cache statedb.TrieNodeCache, mainTrieCacheLimit
 	var resultErr error
 	for childCnt := 0; childCnt < len(children); {
 		select {
-		case <-resultHashCh:
+		case <-resultCh:
 			cnt++
 			if time.Since(logged) < log.StatsReportLimit {
 				continue
@@ -453,8 +454,8 @@ func (bc *BlockChain) warmUpLoop(cache statedb.TrieNodeCache, mainTrieCacheLimit
 			}
 
 			logger.Info("Warm up progress", context...)
-		case err := <-resultErrCh:
-			// if resultErrCh is nil, it means success.
+		case err := <-errCh:
+			// if errCh returns nil, it means success.
 			if err != nil {
 				resultErr = err
 				logger.Warn("Warm up got an error", "err", err)
@@ -488,31 +489,24 @@ func (bc *BlockChain) StartWarmUp() error {
 		return fmt.Errorf("target cache is nil")
 	}
 	db := state.NewDatabaseWithExistingCache(bc.db, cache)
+	children, err := db.TrieDB().NodeChildren(block.Root())
+	if err != nil {
+		return err
+	}
 
 	bc.quitWarmUp = make(chan struct{})
+	logger.Info("Warm up is started", "blockNum", block.NumberU64(), "root", block.Root().String(), "len(children)", len(children))
+
+	resultCh := make(chan struct{}, 10000)
+	errCh := make(chan error)
+	for _, child := range children {
+		go bc.concurrentIterateTrie(child, db, resultCh, errCh)
+	}
 
 	go func() {
-		defer func() {
-			bc.quitWarmUp = nil
-		}()
-
-		children, err := db.TrieDB().NodeChildren(block.Root())
-		if err != nil {
-			logger.Error("Cannot start warming up", "err", err)
-			return
-		}
-
-		logger.Info("Warm up is started", "blockNum", block.NumberU64(), "root", block.Root().String(), "len(children)", len(children))
-
-		resultHashCh := make(chan common.Hash, 10000)
-		resultErrCh := make(chan error)
-
-		for _, child := range children {
-			go bc.concurrentIterateTrie(child, db, resultHashCh, resultErrCh)
-		}
-
+		defer func() { bc.quitWarmUp = nil }()
 		cacheLimitSize := mainTrieDB.GetTrieNodeLocalCacheByteLimit()
-		bc.warmUpLoop(mainTrieDB.TrieNodeCache(), cacheLimitSize, children, resultHashCh, resultErrCh)
+		bc.warmUpLoop(mainTrieDB.TrieNodeCache(), cacheLimitSize, children, resultCh, errCh)
 	}()
 
 	return nil
@@ -527,4 +521,122 @@ func (bc *BlockChain) StopWarmUp() error {
 	close(bc.quitWarmUp)
 
 	return nil
+}
+
+// StartCollectingTrieStats collects state or storage trie statistics.
+func (bc *BlockChain) StartCollectingTrieStats(contractAddr common.Address) error {
+	block := bc.GetBlockByNumber(bc.lastCommittedBlock)
+	if block == nil {
+		return fmt.Errorf("Block #%d not found", bc.lastCommittedBlock)
+	}
+
+	mainTrieDB := bc.StateCache().TrieDB()
+	cache := mainTrieDB.TrieNodeCache()
+	if cache == nil {
+		return fmt.Errorf("target cache is nil")
+	}
+	db := state.NewDatabaseWithExistingCache(bc.db, cache)
+
+	startNode := block.Root()
+	// If the contractAddr is given, start collecting stats from the root of storage trie
+	if !common.EmptyAddress(contractAddr) {
+		var err error
+		startNode, err = bc.GetContractStorageRoot(block, db, contractAddr)
+		if err != nil {
+			logger.Error("Failed to get the contract storage root",
+				"contractAddr", contractAddr.String(), "rootHash", block.Root().String(),
+				"err", err)
+			return err
+		}
+	}
+
+	children, err := db.TrieDB().NodeChildren(startNode)
+	if err != nil {
+		logger.Error("Failed to retrieve the children of start node", "err", err)
+		return err
+	}
+
+	logger.Info("Started collecting trie statistics",
+		"blockNum", block.NumberU64(), "root", block.Root().String(), "len(children)", len(children))
+	go collectTrieStats(db, startNode)
+
+	return nil
+}
+
+// collectChildrenStats wraps CollectChildrenStats, in order to send finish signal to resultCh.
+func collectChildrenStats(db state.Database, child common.Hash, resultCh chan<- statedb.NodeInfo) {
+	db.TrieDB().CollectChildrenStats(child, 2, resultCh)
+	resultCh <- statedb.NodeInfo{Finished: true}
+}
+
+// collectTrieStats is the main function of collecting trie statistics.
+// It spawns goroutines for the upper-most children and iterates each sub-trie.
+func collectTrieStats(db state.Database, startNode common.Hash) {
+	children, err := db.TrieDB().NodeChildren(startNode)
+	if err != nil {
+		logger.Error("Failed to retrieve the children of start node", "err", err)
+	}
+
+	// collecting statistics by running individual goroutines for each child
+	resultCh := make(chan statedb.NodeInfo, 10000)
+	for _, child := range children {
+		go collectChildrenStats(db, child, resultCh)
+	}
+
+	numGoRoutines := len(children)
+	ticker := time.NewTicker(1 * time.Minute)
+
+	numNodes, numLeafNodes, maxDepth := 0, 0, 0
+	depthCounter := make(map[int]int)
+	begin := time.Now()
+	for {
+		select {
+		case result := <-resultCh:
+			if result.Finished {
+				numGoRoutines--
+				if numGoRoutines == 0 {
+					logger.Info("Finished collecting trie statistics", "elapsed", time.Since(begin),
+						"numNodes", numNodes, "numLeafNodes", numLeafNodes, "maxDepth", maxDepth)
+					printDepthStats(depthCounter)
+					return
+				}
+				continue
+			}
+			numNodes++
+			// if a leaf node, collect the depth data
+			if result.Depth != 0 {
+				numLeafNodes++
+				depthCounter[result.Depth]++
+				if result.Depth > maxDepth {
+					maxDepth = result.Depth
+				}
+			}
+		case <-ticker.C:
+			// leave a periodic log
+			logger.Info("Collecting trie statistics is in progress...", "elapsed", time.Since(begin),
+				"numGoRoutines", numGoRoutines, "numNodes", numNodes, "numLeafNodes", numLeafNodes, "maxDepth", maxDepth)
+			printDepthStats(depthCounter)
+		}
+	}
+}
+
+// printDepthStats leaves logs containing the depth and the number of nodes in the depth.
+func printDepthStats(depthCounter map[int]int) {
+	// max depth 20 is set by heuristically
+	for depth := 2; depth < 20; depth++ {
+		if depthCounter[depth] == 0 {
+			continue
+		}
+		logger.Info("number of leaf nodes in a depth",
+			"depth", depth, "numNodes", depthCounter[depth])
+	}
+}
+
+// GetContractStorageRoot returns the storage root of a contract based on the given block.
+func (bc *BlockChain) GetContractStorageRoot(block *types.Block, db state.Database, contractAddr common.Address) (common.Hash, error) {
+	stateDB, err := state.New(block.Root(), db)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("failed to get StateDB - %w", err)
+	}
+	return stateDB.GetContractStorageRoot(contractAddr)
 }

@@ -27,14 +27,20 @@ import (
 var logger = log.NewModuleLogger(log.ChainDataFetcher)
 
 const (
-	MsgIdxTotalSegments = iota
-	MsgIdxSegmentIdx
+	// item indices of message header
+	MsgHeaderTotalSegments = iota
+	MsgHeaderSegmentIdx
+	MsgHeaderLength
 )
 
 const (
 	KeyTotalSegments = "totalSegments"
 	KeySegmentIdx    = "segmentIdx"
 )
+
+type IKey interface {
+	Key() string
+}
 
 // Kafka connects to the brokers in an existing kafka cluster.
 type Kafka struct {
@@ -56,11 +62,42 @@ func NewKafka(conf *KafkaConfig) (*Kafka, error) {
 		return nil, err
 	}
 
-	return &Kafka{
+	kafka := &Kafka{
 		config:   conf,
 		producer: producer,
 		admin:    admin,
-	}, nil
+	}
+
+	blockGroupTopic := conf.GetTopicName(EventBlockGroup)
+	if err := kafka.setupTopic(blockGroupTopic); err != nil {
+		return nil, err
+	}
+
+	traceGroupTopic := conf.GetTopicName(EventTraceGroup)
+	if err := kafka.setupTopic(traceGroupTopic); err != nil {
+		return nil, err
+	}
+	return kafka, nil
+}
+
+func (k *Kafka) setupTopic(topicName string) error {
+	topics, err := k.ListTopics()
+	if err != nil {
+		logger.Error("getting topic has an error", "topicName", topicName, "err", err)
+		return err
+	}
+
+	if detail, exist := topics[topicName]; exist {
+		logger.Info("topic configuration", "topicName", topicName, "partition", detail.NumPartitions, "replicas", detail.ReplicationFactor)
+		return nil
+	}
+
+	if err := k.CreateTopic(topicName); err != nil {
+		logger.Error("creating a topic is failed", "topicName", topicName, "err", err)
+		return err
+	}
+
+	return nil
 }
 
 func (k *Kafka) Close() {
@@ -69,7 +106,7 @@ func (k *Kafka) Close() {
 }
 
 func (k *Kafka) getTopicName(event string) string {
-	return k.config.getTopicName(event)
+	return k.config.GetTopicName(event)
 }
 
 func (k *Kafka) CreateTopic(topic string) error {
@@ -98,9 +135,10 @@ func (k *Kafka) split(data []byte) ([][]byte, int) {
 	return segments, len(segments)
 }
 
-func (k *Kafka) makeProducerMessage(topic string, segment []byte, segmentIdx, totalSegments uint64) *sarama.ProducerMessage {
+func (k *Kafka) makeProducerMessage(topic, key string, segment []byte, segmentIdx, totalSegments uint64) *sarama.ProducerMessage {
 	return &sarama.ProducerMessage{
 		Topic: topic,
+		Key:   sarama.StringEncoder(key),
 		Headers: []sarama.RecordHeader{
 			{
 				Key:   []byte(KeyTotalSegments),
@@ -120,12 +158,16 @@ func (k *Kafka) Publish(topic string, data interface{}) error {
 	if err != nil {
 		return err
 	}
+	key := ""
+	if v, ok := data.(IKey); ok {
+		key = v.Key()
+	}
 	segments, totalSegments := k.split(dataBytes)
 	for idx, segment := range segments {
-		msg := k.makeProducerMessage(topic, segment, uint64(idx), uint64(totalSegments))
+		msg := k.makeProducerMessage(topic, key, segment, uint64(idx), uint64(totalSegments))
 		_, _, err = k.producer.SendMessage(msg)
 		if err != nil {
-			logger.Error("sending kafka message is failed", "err", err, "segmentIdx", idx, "segment", string(segment))
+			logger.Error("sending kafka message is failed", "err", err, "segmentIdx", idx, "key", key)
 			return err
 		}
 	}

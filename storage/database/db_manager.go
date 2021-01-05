@@ -241,6 +241,10 @@ const (
 	databaseEntryTypeSize
 )
 
+func (et DBEntryType) String() string {
+	return dbBaseDirs[et]
+}
+
 const notInMigrationFlag = 0
 const inMigrationFlag = 1
 
@@ -258,14 +262,14 @@ var dbBaseDirs = [databaseEntryTypeSize]string{
 // Sum of dbConfigRatio should be 100.
 // Otherwise, logger.Crit will be called at checkDBEntryConfigRatio.
 var dbConfigRatio = [databaseEntryTypeSize]int{
-	3,  // MiscDB
-	6,  // headerDB
-	16, // BodyDB
-	16, // ReceiptsDB
-	19, // StateTrieDB
-	19, // StateTrieMigrationDB
-	17, // TXLookUpEntryDB
-	4,  // bridgeServiceDB
+	2,  // MiscDB
+	5,  // headerDB
+	5,  // BodyDB
+	5,  // ReceiptsDB
+	40, // StateTrieDB
+	40, // StateTrieMigrationDB
+	2,  // TXLookUpEntryDB
+	1,  // bridgeServiceDB
 }
 
 // checkDBEntryConfigRatio checks if sum of dbConfigRatio is 100.
@@ -329,12 +333,13 @@ func NewMemoryDBManager() DBManager {
 // DBConfig handles database related configurations.
 type DBConfig struct {
 	// General configurations for all types of DB.
-	Dir                string
-	DBType             DBType
-	SingleDB           bool // whether dbs (such as MiscDB, headerDB and etc) share one physical DB
-	NumStateTrieShards uint // the number of shards of state trie db
-	ParallelDBWrite    bool
-	OpenFilesLimit     int
+	Dir                 string
+	DBType              DBType
+	SingleDB            bool // whether dbs (such as MiscDB, headerDB and etc) share one physical DB
+	NumStateTrieShards  uint // the number of shards of state trie db
+	ParallelDBWrite     bool
+	OpenFilesLimit      int
+	EnableDBPerfMetrics bool // If true, read and write performance will be logged
 
 	// LevelDB related configurations.
 	LevelDBCacheSize   int // LevelDBCacheSize = BlockCacheCapacity + WriteBuffer

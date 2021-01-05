@@ -101,12 +101,14 @@ type Config struct {
 	//LightPeers int `toml:",omitempty"` // Maximum number of LES client peers
 
 	OverwriteGenesis bool
+	StartBlockNumber uint64
 
 	// Database options
 	DBType               database.DBType
 	SkipBcVersionCheck   bool `toml:"-"`
 	SingleDB             bool
 	NumStateTrieShards   uint
+	EnableDBPerfMetrics  bool
 	LevelDBCompression   database.LevelDBCompressionType
 	LevelDBBufferPool    bool
 	LevelDBCacheSize     int
@@ -117,8 +119,6 @@ type Config struct {
 	TriesInMemory        uint64
 	SenderTxHashIndexing bool
 	ParallelDBWrite      bool
-	StateDBCaching       bool
-	TxPoolStateCache     bool
 	TrieNodeCacheConfig  statedb.TrieNodeCacheConfig
 
 	// Mining-related options
@@ -162,6 +162,9 @@ type Config struct {
 	AutoRestartFlag    bool
 	RestartTimeOutFlag time.Duration
 	DaemonPathFlag     string
+
+	// RPCGasCap is the global gas cap for eth-call variants.
+	RPCGasCap *big.Int `toml:",omitempty"`
 }
 
 type configMarshaling struct {
