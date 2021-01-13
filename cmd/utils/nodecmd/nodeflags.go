@@ -76,6 +76,7 @@ var CommonNodeFlags = []cli.Flag{
 	utils.MemorySizeFlag,
 	utils.TrieNodeCacheTypeFlag,
 	utils.TrieNodeCacheLimitFlag,
+	utils.TrieNodeCacheSavePeriodFlag,
 	utils.TrieNodeCacheRedisEndpointsFlag,
 	utils.TrieNodeCacheRedisClusterFlag,
 	utils.TrieNodeCacheRedisPublishBlockFlag,
@@ -200,6 +201,7 @@ var KENFlags = []cli.Flag{
 }
 
 var KSCNFlags = []cli.Flag{
+	utils.RewardbaseFlag,
 	utils.ServiceChainSignerFlag,
 	utils.AnchoringPeriodFlag,
 	utils.SentChainTxsLimit,

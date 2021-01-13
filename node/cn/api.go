@@ -39,7 +39,7 @@ import (
 	"github.com/klaytn/klaytn/kerrors"
 	"github.com/klaytn/klaytn/networks/rpc"
 	"github.com/klaytn/klaytn/params"
-	"github.com/klaytn/klaytn/ser/rlp"
+	"github.com/klaytn/klaytn/rlp"
 	"github.com/klaytn/klaytn/storage/statedb"
 	"github.com/klaytn/klaytn/work"
 )
@@ -281,6 +281,12 @@ func (api *PublicDebugAPI) DumpStateTrie(blockNr uint64) (DumpStateTrieResult, e
 // StartWarmUp retrieves all state/storage tries of the latest committed state root and caches the tries.
 func (api *PublicDebugAPI) StartWarmUp() error {
 	return api.cn.blockchain.StartWarmUp()
+}
+
+// StartContractWarmUp retrieves a storage trie of the latest state root and caches the trie
+// corresponding to the given contract address.
+func (api *PublicDebugAPI) StartContractWarmUp(contractAddr common.Address) error {
+	return api.cn.blockchain.StartContractWarmUp(contractAddr)
 }
 
 // StopWarmUp stops the warming up process.

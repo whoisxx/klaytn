@@ -27,6 +27,7 @@ import (
 	"math/big"
 	mrand "math/rand"
 	"reflect"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -46,7 +47,7 @@ import (
 	"github.com/klaytn/klaytn/event"
 	"github.com/klaytn/klaytn/log"
 	"github.com/klaytn/klaytn/params"
-	"github.com/klaytn/klaytn/ser/rlp"
+	"github.com/klaytn/klaytn/rlp"
 	"github.com/klaytn/klaytn/storage/database"
 	"github.com/klaytn/klaytn/storage/statedb"
 	"github.com/rcrowley/go-metrics"
@@ -67,11 +68,13 @@ var (
 	storageUpdateTimer = metrics.NewRegisteredTimer("state/storage/updates", nil)
 	storageCommitTimer = metrics.NewRegisteredTimer("state/storage/commits", nil)
 
-	blockInsertTimer        = metrics.NewRegisteredTimer("chain/inserts", nil)
-	blockProcessTimer       = metrics.NewRegisteredTimer("chain/process", nil)
-	blockExecutionTimer     = metrics.NewRegisteredTimer("chain/execution", nil)
-	blockFinalizeTimer      = metrics.NewRegisteredTimer("chain/finalize", nil)
-	blockValidateTimer      = metrics.NewRegisteredTimer("chain/validate", nil)
+	blockInsertTimer    = metrics.NewRegisteredTimer("chain/inserts", nil)
+	blockProcessTimer   = metrics.NewRegisteredTimer("chain/process", nil)
+	blockExecutionTimer = metrics.NewRegisteredTimer("chain/execution", nil)
+	blockFinalizeTimer  = metrics.NewRegisteredTimer("chain/finalize", nil)
+	blockValidateTimer  = metrics.NewRegisteredTimer("chain/validate", nil)
+	BlockAgeTimer       = metrics.NewRegisteredTimer("chain/age", nil)
+
 	ErrNoGenesis            = errors.New("genesis not found in chain")
 	ErrNotExistNode         = errors.New("the node does not exist in cached node")
 	ErrQuitBySignal         = errors.New("quit by signal")
@@ -103,12 +106,12 @@ const (
 // 2) trie caching/pruning resident in a blockchain.
 type CacheConfig struct {
 	// TODO-Klaytn-Issue1666 Need to check the benefit of trie caching.
-	ArchiveMode          bool                        // If true, state trie is not pruned and always written to database
-	CacheSize            int                         // Size of in-memory cache of a trie (MiB) to flush matured singleton trie nodes to disk
-	BlockInterval        uint                        // Block interval to flush the trie. Each interval state trie will be flushed into disk
-	TriesInMemory        uint64                      // Maximum number of recent state tries according to its block number
-	SenderTxHashIndexing bool                        // Enables saving senderTxHash to txHash mapping information to database and cache
-	TrieNodeCacheConfig  statedb.TrieNodeCacheConfig // Configures trie node cache
+	ArchiveMode          bool                         // If true, state trie is not pruned and always written to database
+	CacheSize            int                          // Size of in-memory cache of a trie (MiB) to flush matured singleton trie nodes to disk
+	BlockInterval        uint                         // Block interval to flush the trie. Each interval state trie will be flushed into disk
+	TriesInMemory        uint64                       // Maximum number of recent state tries according to its block number
+	SenderTxHashIndexing bool                         // Enables saving senderTxHash to txHash mapping information to database and cache
+	TrieNodeCacheConfig  *statedb.TrieNodeCacheConfig // Configures trie node cache
 }
 
 // gcBlock is used for priority queue for GC.
@@ -204,6 +207,10 @@ func NewBlockChain(db database.DBManager, cacheConfig *CacheConfig, chainConfig 
 		}
 	}
 
+	if cacheConfig.TrieNodeCacheConfig == nil {
+		cacheConfig.TrieNodeCacheConfig = statedb.GetEmptyTrieNodeCacheConfig()
+	}
+
 	state.EnabledExpensive = db.GetDBConfig().EnableDBPerfMetrics
 
 	// Initialize DeriveSha implementation
@@ -265,6 +272,18 @@ func NewBlockChain(db database.DBManager, cacheConfig *CacheConfig, chainConfig 
 	go bc.update()
 	go bc.gcCachedNodeLoop()
 	go bc.restartStateMigration()
+
+	if cacheConfig.TrieNodeCacheConfig.DumpPeriodically() {
+		logger.Info("LocalCache is used for trie node cache, start saving cache to file periodically",
+			"dir", bc.cacheConfig.TrieNodeCacheConfig.FastCacheFileDir,
+			"period", bc.cacheConfig.TrieNodeCacheConfig.FastCacheSavePeriod)
+		trieDB := bc.stateCache.TrieDB()
+		bc.wg.Add(1)
+		go func() {
+			defer bc.wg.Done()
+			trieDB.SaveCachePeriodically(bc.cacheConfig.TrieNodeCacheConfig, bc.quit)
+		}()
+	}
 
 	return bc, nil
 }
@@ -375,9 +394,9 @@ func (bc *BlockChain) loadLastState() error {
 	blockTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64())
 	fastTd := bc.GetTd(currentFastBlock.Hash(), currentFastBlock.NumberU64())
 
-	logger.Info("Loaded most recent local header", "number", currentHeader.Number, "hash", currentHeader.Hash(), "td", headerTd)
-	logger.Info("Loaded most recent local full block", "number", currentBlock.Number(), "hash", currentBlock.Hash(), "td", blockTd)
-	logger.Info("Loaded most recent local fast block", "number", currentFastBlock.Number(), "hash", currentFastBlock.Hash(), "td", fastTd)
+	logger.Info("Loaded most recent local header", "number", currentHeader.Number, "hash", currentHeader.Hash(), "td", headerTd, "age", common.PrettyAge(time.Unix(int64(currentHeader.Time.Uint64()), 0)))
+	logger.Info("Loaded most recent local full block", "number", currentBlock.Number(), "hash", currentBlock.Hash(), "td", blockTd, "age", common.PrettyAge(time.Unix(int64(currentHeader.Time.Uint64()), 0)))
+	logger.Info("Loaded most recent local fast block", "number", currentFastBlock.Number(), "hash", currentFastBlock.Hash(), "td", fastTd, "age", common.PrettyAge(time.Unix(int64(currentHeader.Time.Uint64()), 0)))
 
 	return nil
 }
@@ -1672,6 +1691,8 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 		trieAccess := stateDB.AccountReads + stateDB.AccountHashes + stateDB.AccountUpdates + stateDB.AccountCommits
 		trieAccess += stateDB.StorageReads + stateDB.StorageHashes + stateDB.StorageUpdates + stateDB.StorageCommits
 
+		BlockAgeTimer.Update(time.Since(time.Unix(int64(block.Time().Uint64()), 0)))
+
 		switch writeResult.Status {
 		case CanonStatTy:
 			processTxsTime := common.PrettyDuration(procStats.AfterApplyTxs.Sub(procStats.BeforeApplyTxs))
@@ -1891,6 +1912,10 @@ func (st *insertStats) report(chain []*types.Block, index int, cache common.Stor
 			"number", end.Number(), "hash", end.Hash(), "blocks", st.processed, "txs", txs, "elapsed", common.PrettyDuration(elapsed),
 			"trieDBSize", cache, "mgas", float64(st.usedGas) / 1000000, "mgasps", float64(st.usedGas) * 1000 / float64(elapsed),
 		}
+
+		timestamp := time.Unix(int64(end.Time().Uint64()), 0)
+		context = append(context, []interface{}{"age", common.PrettyAge(timestamp)}...)
+
 		if st.queued > 0 {
 			context = append(context, []interface{}{"queued", st.queued}...)
 		}
@@ -2267,7 +2292,11 @@ func (bc *BlockChain) IsSenderTxHashIndexingEnabled() bool {
 }
 
 func (bc *BlockChain) SaveTrieNodeCacheToDisk() error {
-	return bc.stateCache.TrieDB().SaveTrieNodeCacheToFile(bc.cacheConfig.TrieNodeCacheConfig.FastCacheFileDir)
+	if err := bc.stateCache.TrieDB().CanSaveTrieNodeCacheToFile(); err != nil {
+		return err
+	}
+	go bc.stateCache.TrieDB().SaveTrieNodeCacheToFile(bc.cacheConfig.TrieNodeCacheConfig.FastCacheFileDir, runtime.NumCPU()/2)
+	return nil
 }
 
 // ApplyTransaction attempts to apply a transaction to the given state database

@@ -167,37 +167,10 @@ type shardedDBIterator struct {
 	//resultCh chan pdbBatchResult
 }
 
-// NewIterator creates a binary-alphabetical iterator over the entire keyspace
-// contained within the key-value database.
-func (pdb *shardedDB) NewIterator() Iterator {
-	// TODO-Klaytn implement this later.
-	return nil
-}
-
-// NewIteratorWithStart creates a binary-alphabetical iterator over a subset of
-// database content starting at a particular initial key (or after, if it does
-// not exist).
-func (pdb *shardedDB) NewIteratorWithStart(start []byte) Iterator {
-	// TODO-Klaytn implement this later.
-	iterators := make([]Iterator, 0, pdb.numShards)
-	for i := 0; i < int(pdb.numShards); i++ {
-		iterators = append(iterators, pdb.shards[i].NewIteratorWithStart(start))
-	}
-
-	for _, iter := range iterators {
-		if iter != nil {
-			if !iter.Next() {
-				iter = nil
-			}
-		}
-	}
-
-	return &shardedDBIterator{iterators, nil, nil}
-}
-
-// NewIteratorWithPrefix creates a binary-alphabetical iterator over a subset
-// of database content with a particular key prefix.
-func (pdb *shardedDB) NewIteratorWithPrefix(prefix []byte) Iterator {
+// NewIterator creates a binary-alphabetical iterator over a subset
+// of database content with a particular key prefix, starting at a particular
+// initial key (or after, if it does not exist).
+func (pdb *shardedDB) NewIterator(prefix []byte, start []byte) Iterator {
 	// TODO-Klaytn implement this later.
 	return nil
 }
@@ -289,6 +262,14 @@ func (sdbBatch *shardedDBBatch) Put(key []byte, value []byte) error {
 	}
 }
 
+func (sdbBatch *shardedDBBatch) Delete(key []byte) error {
+	if ShardIndex, err := shardIndexByKey(key, uint(sdbBatch.numBatches)); err != nil {
+		return err
+	} else {
+		return sdbBatch.batches[ShardIndex].Delete(key)
+	}
+}
+
 // ValueSize is called to determine whether to write batches when it exceeds
 // certain limit. shardedDB returns the largest size of its batches to
 // write all batches at once when one of batch exceeds the limit.
@@ -324,4 +305,13 @@ func (sdbBatch *shardedDBBatch) Reset() {
 	for _, batch := range sdbBatch.batches {
 		batch.Reset()
 	}
+}
+
+func (sdbBatch *shardedDBBatch) Replay(w KeyValueWriter) error {
+	for _, batch := range sdbBatch.batches {
+		if err := batch.Replay(w); err != nil {
+			return err
+		}
+	}
+	return nil
 }

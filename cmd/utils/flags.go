@@ -322,6 +322,11 @@ var (
 		Usage: "Memory allowance (MB) to use for caching trie nodes in memory. -1 is for auto-scaling",
 		Value: -1,
 	}
+	TrieNodeCacheSavePeriodFlag = cli.DurationFlag{
+		Name:  "state.trie-cache-save-period",
+		Usage: "Period of saving in memory trie cache to file if fastcache is used, 0 means disabled",
+		Value: 0,
+	}
 	SenderTxHashIndexingFlag = cli.BoolFlag{
 		Name:  "sendertxhashindexing",
 		Usage: "Enables storing mapping information of senderTxHash to txHash",
@@ -1121,7 +1126,7 @@ func setWS(ctx *cli.Context, cfg *node.Config) {
 // setIPC creates an IPC path configuration from the set command line flags,
 // returning an empty string if IPC was explicitly disabled, or the set path.
 func setIPC(ctx *cli.Context, cfg *node.Config) {
-	checkExclusive(ctx, IPCDisabledFlag, IPCPathFlag)
+	CheckExclusive(ctx, IPCDisabledFlag, IPCPathFlag)
 	switch {
 	case ctx.GlobalBool(IPCDisabledFlag.Name):
 		cfg.IPCPath = ""
@@ -1339,10 +1344,10 @@ func setTxPool(ctx *cli.Context, cfg *blockchain.TxPoolConfig) {
 	}
 }
 
-// checkExclusive verifies that only a single instance of the provided flags was
+// CheckExclusive verifies that only a single instance of the provided flags was
 // set by the user. Each flag might optionally be followed by a string type to
 // specialize it further.
-func checkExclusive(ctx *cli.Context, args ...interface{}) {
+func CheckExclusive(ctx *cli.Context, args ...interface{}) {
 	set := make([]string, 0, 1)
 	for i := 0; i < len(args); i++ {
 		// Make sure the next argument is a flag and skip if not set
@@ -1491,6 +1496,7 @@ func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 			Name)).ToValid(),
 		LocalCacheSizeMB:          ctx.GlobalInt(TrieNodeCacheLimitFlag.Name),
 		FastCacheFileDir:          ctx.GlobalString(DataDirFlag.Name) + "/fastcache",
+		FastCacheSavePeriod:       ctx.GlobalDuration(TrieNodeCacheSavePeriodFlag.Name),
 		RedisEndpoints:            ctx.GlobalStringSlice(TrieNodeCacheRedisEndpointsFlag.Name),
 		RedisClusterEnable:        ctx.GlobalBool(TrieNodeCacheRedisClusterFlag.Name),
 		RedisPublishBlockEnable:   ctx.GlobalBool(TrieNodeCacheRedisPublishBlockFlag.Name),
@@ -1605,7 +1611,7 @@ func MakeConsolePreloads(ctx *cli.Context) []string {
 		return nil
 	}
 	// Otherwise resolve absolute paths and return them
-	preloads := []string{}
+	var preloads []string
 
 	assets := ctx.GlobalString(JSpathFlag.Name)
 	for _, file := range strings.Split(ctx.GlobalString(PreloadJSFlag.Name), ",") {

@@ -413,17 +413,7 @@ func (dynamo *dynamoDB) Meter(prefix string) {
 	dynamoBatchWriteTimeMeter = metrics.NewRegisteredMeter(prefix+"batchwrite/time", nil)
 }
 
-func (dynamo *dynamoDB) NewIterator() Iterator {
-	// TODO-Klaytn: implement this later.
-	return nil
-}
-
-func (dynamo *dynamoDB) NewIteratorWithStart(start []byte) Iterator {
-	// TODO-Klaytn: implement this later.
-	return nil
-}
-
-func (dynamo *dynamoDB) NewIteratorWithPrefix(prefix []byte) Iterator {
+func (dynamo *dynamoDB) NewIterator(prefix []byte, start []byte) Iterator {
 	// TODO-Klaytn: implement this later.
 	return nil
 }
@@ -559,6 +549,12 @@ func (batch *dynamoBatch) Put(key, val []byte) error {
 	return nil
 }
 
+// Delete inserts the a key removal into the batch for later committing.
+func (batch *dynamoBatch) Delete(key []byte) error {
+	logger.CritWithStack("Delete should not be called when using dynamodb batch")
+	return nil
+}
+
 func (batch *dynamoBatch) Write() error {
 	var writeRequest []*dynamodb.WriteRequest
 	numRemainedItems := len(batch.batchItems)
@@ -587,4 +583,9 @@ func (batch *dynamoBatch) Reset() {
 	batch.batchItems = []*dynamodb.WriteRequest{}
 	batch.keyMap = map[string]struct{}{}
 	batch.size = 0
+}
+
+func (batch *dynamoBatch) Replay(w KeyValueWriter) error {
+	logger.CritWithStack("Replay should not be called when using dynamodb batch")
+	return nil
 }

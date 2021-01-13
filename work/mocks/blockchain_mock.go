@@ -18,7 +18,7 @@ import (
 	consensus "github.com/klaytn/klaytn/consensus"
 	event "github.com/klaytn/klaytn/event"
 	params "github.com/klaytn/klaytn/params"
-	rlp "github.com/klaytn/klaytn/ser/rlp"
+	rlp "github.com/klaytn/klaytn/rlp"
 )
 
 // MockBlockChain is a mock of BlockChain interface
@@ -724,6 +724,20 @@ func (m *MockBlockChain) StartCollectingTrieStats(arg0 common.Address) error {
 func (mr *MockBlockChainMockRecorder) StartCollectingTrieStats(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StartCollectingTrieStats", reflect.TypeOf((*MockBlockChain)(nil).StartCollectingTrieStats), arg0)
+}
+
+// StartContractWarmUp mocks base method
+func (m *MockBlockChain) StartContractWarmUp(arg0 common.Address) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "StartContractWarmUp", arg0)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// StartContractWarmUp indicates an expected call of StartContractWarmUp
+func (mr *MockBlockChainMockRecorder) StartContractWarmUp(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StartContractWarmUp", reflect.TypeOf((*MockBlockChain)(nil).StartContractWarmUp), arg0)
 }
 
 // StartStateMigration mocks base method

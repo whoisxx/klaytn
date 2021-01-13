@@ -25,16 +25,14 @@ import (
 	"time"
 
 	"github.com/klaytn/klaytn/common/fdlimit"
+	"github.com/klaytn/klaytn/log"
 	metricutils "github.com/klaytn/klaytn/metrics/utils"
-
+	"github.com/rcrowley/go-metrics"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/filter"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
-
-	"github.com/klaytn/klaytn/log"
-	"github.com/rcrowley/go-metrics"
 )
 
 var OpenFileLimit = 64
@@ -301,22 +299,11 @@ func (db *levelDB) Delete(key []byte) error {
 	return db.db.Delete(key, nil)
 }
 
-// NewIterator creates a binary-alphabetical iterator over the entire keyspace
-// contained within the leveldb database.
-func (db *levelDB) NewIterator() Iterator {
-	return db.db.NewIterator(nil, nil)
-}
-
-// NewIteratorWithStart creates a binary-alphabetical iterator over a subset of
-// database content starting at a particular initial key (or after, if it does
-// not exist).
-func (db *levelDB) NewIteratorWithStart(start []byte) Iterator {
-	return db.db.NewIterator(&util.Range{Start: start}, nil)
-}
-
-// NewIteratorWithPrefix returns a iterator to iterate over subset of database content with a particular prefix.
-func (db *levelDB) NewIteratorWithPrefix(prefix []byte) Iterator {
-	return db.db.NewIterator(util.BytesPrefix(prefix), nil)
+// NewIterator creates a binary-alphabetical iterator over a subset
+// of database content with a particular key prefix, starting at a particular
+// initial key (or after, if it does not exist).
+func (db *levelDB) NewIterator(prefix []byte, start []byte) Iterator {
+	return db.db.NewIterator(bytesPrefixRange(prefix, start), nil)
 }
 
 func (db *levelDB) Close() {
@@ -485,18 +472,29 @@ func (db *levelDB) NewBatch() Batch {
 	return &ldbBatch{b: new(leveldb.Batch), ldb: db}
 }
 
+// ldbBatch is a write-only leveldb batch that commits changes to its host database
+// when Write is called. A batch cannot be used concurrently.
 type ldbBatch struct {
 	b    *leveldb.Batch
 	ldb  *levelDB
 	size int
 }
 
+// Put inserts the given value into the batch for later committing.
 func (b *ldbBatch) Put(key, value []byte) error {
 	b.b.Put(key, value)
 	b.size += len(value)
 	return nil
 }
 
+// Delete inserts the a key removal into the batch for later committing.
+func (b *ldbBatch) Delete(key []byte) error {
+	b.b.Delete(key)
+	b.size++
+	return nil
+}
+
+// Write flushes any accumulated data to disk.
 func (b *ldbBatch) Write() error {
 	if b.ldb.perfCheck {
 		start := time.Now()
@@ -511,11 +509,51 @@ func (b *ldbBatch) write() error {
 	return b.ldb.db.Write(b.b, nil)
 }
 
+// ValueSize retrieves the amount of data queued up for writing.
 func (b *ldbBatch) ValueSize() int {
 	return b.size
 }
 
+// Reset resets the batch for reuse.
 func (b *ldbBatch) Reset() {
 	b.b.Reset()
 	b.size = 0
+}
+
+// bytesPrefixRange returns key range that satisfy
+// - the given prefix, and
+// - the given seek position
+func bytesPrefixRange(prefix, start []byte) *util.Range {
+	r := util.BytesPrefix(prefix)
+	r.Start = append(r.Start, start...)
+	return r
+}
+
+// Replay replays the batch contents.
+func (b *ldbBatch) Replay(w KeyValueWriter) error {
+	return b.b.Replay(&replayer{writer: w})
+}
+
+// replayer is a small wrapper to implement the correct replay methods.
+type replayer struct {
+	writer  KeyValueWriter
+	failure error
+}
+
+// Put inserts the given value into the key-value data store.
+func (r *replayer) Put(key, value []byte) {
+	// If the replay already failed, stop executing ops
+	if r.failure != nil {
+		return
+	}
+	r.failure = r.writer.Put(key, value)
+}
+
+// Delete removes the key from the key-value data store.
+func (r *replayer) Delete(key []byte) {
+	// If the replay already failed, stop executing ops
+	if r.failure != nil {
+		return
+	}
+	r.failure = r.writer.Delete(key)
 }
