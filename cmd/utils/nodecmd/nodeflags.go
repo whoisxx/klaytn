@@ -75,6 +75,7 @@ var CommonNodeFlags = []cli.Flag{
 	utils.CacheUsageLevelFlag,
 	utils.MemorySizeFlag,
 	utils.TrieNodeCacheTypeFlag,
+	utils.TrieNodeCacheNoPrefetchFlag,
 	utils.TrieNodeCacheLimitFlag,
 	utils.TrieNodeCacheSavePeriodFlag,
 	utils.TrieNodeCacheRedisEndpointsFlag,
@@ -127,6 +128,7 @@ var CommonRPCFlags = []cli.Flag{
 	utils.GRPCPortFlag,
 	utils.WSApiFlag,
 	utils.WSAllowedOriginsFlag,
+	utils.WSMaxSubscriptionPerConn,
 	utils.IPCDisabledFlag,
 	utils.IPCPathFlag,
 }
