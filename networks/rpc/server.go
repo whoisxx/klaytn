@@ -55,16 +55,27 @@ var (
 	// pendingRequestCount is a total number of concurrent RPC method calls
 	pendingRequestCount int64 = 0
 
+	// TODO-Klaytn: move websocket configurations to Config struct in /network/rpc/server.go
 	// MaxSubscriptionPerConn is a maximum number of subscription for a server connection
 	MaxSubscriptionPerConn int32 = 5
+
+	// WebsocketReadDeadline is the read deadline on the underlying network connection in seconds. 0 means read will not timeout
+	WebsocketReadDeadline int64 = 0
+
+	// WebsocketWriteDeadline is the write deadline on the underlying network connection in seconds. 0 means write will not timeout
+	WebsocketWriteDeadline int64 = 0
+
+	// MaxSubscription is a maximum number of websocket connections
+	MaxWebsocketConnections int32 = 3000
 )
 
 // NewServer will create a new server instance with no registered handlers.
 func NewServer() *Server {
 	server := &Server{
-		services: make(serviceRegistry),
-		codecs:   set.New(),
-		run:      1,
+		services:    make(serviceRegistry),
+		codecs:      set.New(),
+		run:         1,
+		wsConnCount: 0,
 	}
 
 	// register a default service which will provide meta information about the RPC service such as the services and
@@ -344,6 +355,7 @@ func (s *Server) handle(ctx context.Context, codec ServerCodec, req *serverReque
 			return codec.CreateResponse(req.id, true), nil
 		}
 		rpcErrorResponsesCounter.Inc(1)
+		wsUnsubscriptionReqCounter.Inc(1)
 		return codec.CreateErrorResponse(&req.id, &invalidParamsError{"Expected subscription id as first argument"}), nil
 	}
 
@@ -368,6 +380,7 @@ func (s *Server) handle(ctx context.Context, codec ServerCodec, req *serverReque
 		}
 		atomic.AddInt32(subCnt, 1)
 		rpcSuccessResponsesCounter.Inc(1)
+		wsSubscriptionReqCounter.Inc(1)
 		return codec.CreateResponse(req.id, subid), activateSub
 	}
 
@@ -402,7 +415,6 @@ func (s *Server) handle(ctx context.Context, codec ServerCodec, req *serverReque
 		rpcSuccessResponsesCounter.Inc(1)
 		return codec.CreateResponse(req.id, nil), nil
 	}
-
 	if req.callb.errPos >= 0 { // test if method returned an error
 		if !reply[req.callb.errPos].IsNil() {
 			e := reply[req.callb.errPos].Interface().(error)
