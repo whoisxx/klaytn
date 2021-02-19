@@ -554,14 +554,7 @@ workflows:
             - test-others
             - tag-verify
             - tagger-verify
-            - test-linter
-
-      - trigger_kes_pipeline:
-          requires: 
-            - pass-tests
-          filters:
-            branches:
-              only: dev
+          filters: *filter-version-not-release
 
       - tag-verify:
           filters: *filter-only-version-tag
