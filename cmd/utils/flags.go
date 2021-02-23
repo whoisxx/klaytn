@@ -325,7 +325,7 @@ var (
 	}
 	TrieNodeCacheLimitFlag = cli.IntFlag{
 		Name:  "state.trie-cache-limit",
-		Usage: "Memory allowance (MB) to use for caching trie nodes in memory. -1 is for auto-scaling",
+		Usage: "Memory allowance (MiB) to use for caching trie nodes in memory. -1 is for auto-scaling",
 		Value: -1,
 	}
 	TrieNodeCacheSavePeriodFlag = cli.DurationFlag{
@@ -1147,7 +1147,7 @@ func setWS(ctx *cli.Context, cfg *node.Config) {
 	if ctx.GlobalIsSet(WSApiFlag.Name) {
 		cfg.WSModules = splitAndTrim(ctx.GlobalString(WSApiFlag.Name))
 	}
-	rpc.MaxSubscriptionPerConn = int32(ctx.GlobalInt(WSMaxSubscriptionPerConn.Name))
+	rpc.MaxSubscriptionPerWSConn = int32(ctx.GlobalInt(WSMaxSubscriptionPerConn.Name))
 	rpc.WebsocketReadDeadline = ctx.GlobalInt64(WSReadDeadLine.Name)
 	rpc.WebsocketWriteDeadline = ctx.GlobalInt64(WSWriteDeadLine.Name)
 	rpc.MaxWebsocketConnections = int32(ctx.GlobalInt(WSMaxConnections.Name))
@@ -1525,7 +1525,7 @@ func SetKlayConfig(ctx *cli.Context, stack *node.Node, cfg *cn.Config) {
 		CacheType: statedb.TrieNodeCacheType(ctx.GlobalString(TrieNodeCacheTypeFlag.
 			Name)).ToValid(),
 		NumFetcherPrefetchWorker:  ctx.GlobalInt(NumFetcherPrefetchWorkerFlag.Name),
-		LocalCacheSizeMB:          ctx.GlobalInt(TrieNodeCacheLimitFlag.Name),
+		LocalCacheSizeMiB:         ctx.GlobalInt(TrieNodeCacheLimitFlag.Name),
 		FastCacheFileDir:          ctx.GlobalString(DataDirFlag.Name) + "/fastcache",
 		FastCacheSavePeriod:       ctx.GlobalDuration(TrieNodeCacheSavePeriodFlag.Name),
 		RedisEndpoints:            ctx.GlobalStringSlice(TrieNodeCacheRedisEndpointsFlag.Name),
