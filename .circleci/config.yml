@@ -522,6 +522,11 @@ jobs:
     steps:
       - trigger_kes_pipeline
 
+  trigger_kes_pipeline:
+    executor: default
+    steps:
+      - trigger_kes_pipeline
+
 workflows:
   version: 2
   build_n_packaging:
@@ -555,6 +560,13 @@ workflows:
             - tag-verify
             - tagger-verify
           filters: *filter-version-not-release
+
+      - trigger_kes_pipeline:
+          requires:
+            - pass-tests
+          filters:
+            branches:
+              only: dev
 
       - tag-verify:
           filters: *filter-only-version-tag
